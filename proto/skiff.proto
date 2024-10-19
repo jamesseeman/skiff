@@ -1,0 +1,35 @@
+syntax = "proto3";
+package skiff;
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetReply {
+  optional bytes value = 1;
+}
+
+message InsertRequest {
+  optional string tree = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message InsertReply {
+  bool success = 1;
+}
+
+message DeleteRequest {
+  optional string tree = 1;
+  string key = 2;
+}
+
+message DeleteReply {
+  bool success = 1;
+}
+
+service Skiff {
+  rpc Get(GetRequest) returns (GetReply);
+  rpc Insert(InsertRequest) returns (InsertReply);
+  rpc Delete(DeleteRequest) returns (DeleteReply);
+}
