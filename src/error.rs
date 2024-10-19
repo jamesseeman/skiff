@@ -15,6 +15,16 @@ pub enum SkiffError {
     DataDirectoryCreateFailed,
     #[error("Failed to open sled database")]
     SledError,
+    #[error("Client failed to connect")]
+    ClientConnectFailed,
+    #[error("RPC client call failed")]
+    RPCCallFailed,
+    #[error("Deserialize failed")]
+    DeserializeFailed,
+    #[error("Serialize failed")]
+    SerializeFailed,
+    #[error("Insert failed")]
+    InsertFailed,
 }
 
 impl From<tonic::transport::Error> for SkiffError {
@@ -32,5 +42,11 @@ impl From<std::io::Error> for SkiffError {
 impl From<sled::Error> for SkiffError {
     fn from(err: sled::Error) -> Self {
         Self::SledError
+    }
+}
+
+impl From<bincode::Error> for SkiffError {
+    fn from(err: bincode::Error) -> Self {
+        Self::SerializeFailed
     }
 }

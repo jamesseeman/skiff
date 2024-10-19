@@ -14,7 +14,10 @@ use raft_proto::{
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use skiff_proto::{DeleteReply, DeleteRequest, GetReply, GetRequest, InsertReply, InsertRequest};
+use skiff_proto::{
+    skiff_server::SkiffServer, DeleteReply, DeleteRequest, GetReply, GetRequest, InsertReply,
+    InsertRequest,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -25,13 +28,6 @@ use std::{
 };
 use tokio::sync::{mpsc, Mutex};
 use tonic::{transport::Channel, Request, Response, Status};
-
-#[derive(Debug, Clone)]
-enum Message {
-    EntryRequest(EntryRequest),
-    VoteRequest(VoteRequest),
-    ServerRequest(ServerRequest),
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Action {
@@ -278,8 +274,13 @@ impl Skiff {
         });
     }
 
+    async fn get_logs(&self, peer: &Ipv4Addr) -> Vec<raft_proto::Log> {
+        println!("Number of logs: {}", self.state.lock().await.log.len());
+        vec![]
+    }
+
     async fn reset_heartbeat_timer(&self) {
-        self.tx_entries.lock().await.send(1).await; // Can be anything
+        let _ = self.tx_entries.lock().await.send(1).await; // Can be anything
     }
 
     // TODO: Add token for authenticated joins
@@ -301,7 +302,8 @@ impl Skiff {
 
         let bind_address = SocketAddr::new(self.get_address().into(), 9400);
         tonic::transport::Server::builder()
-            .add_service(RaftServer::new(self))
+            .add_service(RaftServer::new(self.clone()))
+            .add_service(SkiffServer::new(self))
             .serve(bind_address)
             .await?;
 
@@ -332,28 +334,13 @@ impl Skiff {
                             let last_log_term = self.get_last_log_term().await;
                             let commited_index = self.get_commit_index().await;
                             let current_term = self.get_current_term().await;
+                            let entries = self.get_logs(&peer).await;
                             let mut request = Request::new(EntryRequest {
                                 term: current_term,
                                 leader_id: self.id,
                                 prev_log_index: last_log_index,
                                 prev_log_term: last_log_term,
-                                entries: vec![
-                                    raft_proto::Log {
-                                        action: raft_proto::Action::Insert.into(),
-                                        key: "key1".into(),
-                                        value: Some(bincode::serialize(&42).unwrap()),
-                                    },
-                                    raft_proto::Log {
-                                        action: raft_proto::Action::Insert.into(),
-                                        key: "key2".into(),
-                                        value: Some(bincode::serialize(&self.address.to_string()).unwrap()),
-                                    },
-                                    raft_proto::Log {
-                                        action: raft_proto::Action::Insert.into(),
-                                        key: "key3".into(),
-                                        value: Some(bincode::serialize(&ElectionState::Leader).unwrap()),
-                                    },
-                                ],
+                                entries: entries,
                                 leader_commit: commited_index as u32,
                             });
                             request.set_timeout(Duration::from_millis(300));
@@ -429,7 +416,7 @@ impl Skiff {
 
             // Send empty heartbeat
             // Todo: might want to move this duplicated block to function
-            
+
             for (peer, client) in self.get_peer_clients().await.into_iter() {
                 let last_log_index = self.get_last_log_index().await;
                 let last_log_term = self.get_last_log_term().await;
@@ -451,10 +438,6 @@ impl Skiff {
             }
         }
 
-        Ok(())
-    }
-
-    async fn client_manager(&self) -> Result<(), anyhow::Error> {
         Ok(())
     }
 }
@@ -546,21 +529,19 @@ impl Raft for Skiff {
 
 #[tonic::async_trait]
 impl skiff_proto::skiff_server::Skiff for Skiff {
+    // Todo: add tree functionality
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetReply>, Status> {
         let get_request = request.into_inner();
-        let value = self
-            .state
-            .lock()
-            .await
-            .conn
-            .get(get_request.key)
-            .unwrap_or({ return Err(Status::internal("failed to query sled db")) });
+        let value = self.state.lock().await.conn.get(get_request.key);
 
         match value {
-            Some(value) => Ok(Response::new(GetReply {
-                value: Some(value.to_vec()),
-            })),
-            None => Ok(Response::new(GetReply { value: None })),
+            Ok(inner1) => match inner1 {
+                Some(data) => Ok(Response::new(GetReply {
+                    value: Some(data.to_vec()),
+                })),
+                None => Ok(Response::new(GetReply { value: None })),
+            },
+            Err(_) => Err(Status::internal("failed to query sled db")),
         }
     }
 
