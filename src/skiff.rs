@@ -18,10 +18,10 @@ use skiff_proto::{
     skiff_server::SkiffServer, DeleteReply, DeleteRequest, GetReply, GetRequest, InsertReply,
     InsertRequest,
 };
-use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
+use std::{cmp::min, fs};
+use std::{collections::HashMap, thread::current};
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
@@ -40,7 +40,7 @@ struct Log {
     index: u32,
     term: u32,
     action: Action,
-    commited: bool,
+    committed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,16 +55,16 @@ struct State {
     election_state: ElectionState,
     current_term: u32,
     voted_for: Option<u32>,
-    commited_index: usize,
-    last_applied: usize,
+    committed_index: u32,
+    last_applied: u32,
 
     // todo: potentically separate cluster logic
     cluster: Vec<Ipv4Addr>,
     peer_clients: HashMap<Ipv4Addr, Arc<Mutex<RaftClient<Channel>>>>,
 
     // todo: potentially separate leader state
-    next_index: HashMap<Ipv4Addr, usize>,
-    match_index: HashMap<Ipv4Addr, usize>,
+    next_index: HashMap<Ipv4Addr, u32>,
+    match_index: HashMap<Ipv4Addr, u32>,
 
     log: Vec<Log>,
     conn: sled::Tree,
@@ -97,7 +97,7 @@ impl Skiff {
                 election_state: ElectionState::Follower,
                 current_term: 0,
                 voted_for: None,
-                commited_index: 0,
+                committed_index: 0,
                 last_applied: 0,
                 cluster: vec![],
                 peer_clients: HashMap::new(),
@@ -138,7 +138,7 @@ impl Skiff {
                 election_state: ElectionState::Follower,
                 current_term: 0,
                 voted_for: None,
-                commited_index: 0,
+                committed_index: 0,
                 last_applied: 0,
                 cluster: cluster,
                 peer_clients: HashMap::new(),
@@ -161,16 +161,19 @@ impl Skiff {
         self.state.lock().await.cluster.clone()
     }
 
-    async fn get_peer_clients(&self) -> Vec<(Ipv4Addr, Arc<Mutex<RaftClient<Channel>>>)> {
-        let peers: Vec<Ipv4Addr> = self
-            .state
+    async fn get_peers(&self) -> Vec<Ipv4Addr> {
+        self.state
             .lock()
             .await
             .cluster
             .clone()
             .into_iter()
             .filter(|addr| *addr != self.address)
-            .collect();
+            .collect()
+    }
+
+    async fn get_peer_clients(&self) -> Vec<(Ipv4Addr, Arc<Mutex<RaftClient<Channel>>>)> {
+        let peers = self.get_peers().await;
 
         let lock = self.state.lock().await;
         let mut retry = vec![];
@@ -230,6 +233,8 @@ impl Skiff {
         self.state.lock().await.current_term = term;
     }
 
+    // todo: this is a slightly naive approach, retrieving index for log[-1], might not be 100% accurate
+    // should be, since index increases monotonically, but might not in the event of cluster issues?
     async fn get_last_log_index(&self) -> u32 {
         self.state
             .lock()
@@ -251,7 +256,7 @@ impl Skiff {
     }
 
     async fn get_commit_index(&self) -> u32 {
-        self.state.lock().await.commited_index as u32
+        self.state.lock().await.committed_index
     }
 
     async fn vote_for(&self, candidate_id: Option<u32>) {
@@ -270,13 +275,75 @@ impl Skiff {
             index: last_index + 1,
             term: current_term,
             action,
-            commited: false,
+            committed: false,
         });
+
+        println!("{:?}", lock.log);
     }
 
-    async fn get_logs(&self, peer: &Ipv4Addr) -> Vec<raft_proto::Log> {
-        println!("Number of logs: {}", self.state.lock().await.log.len());
-        vec![]
+    async fn get_logs(&self, peer: &Ipv4Addr) -> (u32, u32, Vec<raft_proto::Log>) {
+        let lock = self.state.lock().await;
+        let log_next_index = lock.next_index.get(peer).unwrap();
+        let mut prev_log_index = 0;
+        let mut prev_log_term = 0;
+        let mut new_logs: Vec<raft_proto::Log> = vec![];
+
+        for log in &lock.log {
+            // Get latest log that should already be in peer's log
+            if log.index < *log_next_index && log.index > prev_log_index {
+                prev_log_index = log.index;
+                prev_log_term = log.term;
+            } else if log.index >= *log_next_index {
+                new_logs.push(match &log.action {
+                    Action::Insert(key, value) => raft_proto::Log {
+                        index: log.index,
+                        action: raft_proto::Action::Insert as i32,
+                        key: key.clone(),
+                        value: Some(value.clone()),
+                    },
+                    Action::Delete(key) => raft_proto::Log {
+                        index: log.index,
+                        action: raft_proto::Action::Delete as i32,
+                        key: key.clone(),
+                        value: None,
+                    },
+                });
+            }
+        }
+
+        (prev_log_index, prev_log_term, new_logs)
+    }
+
+    async fn commit_logs(&self, new_commit_index: u32) -> Result<(), sled::Error> {
+        println!("Committing");
+
+        let new_logs: Vec<(usize, Action)> = self
+            .state
+            .lock()
+            .await
+            .log
+            .iter()
+            .enumerate()
+            .map(|(i, log)| (i, log.action.clone()))
+            .collect();
+        for (i, action) in new_logs {
+            match action {
+                Action::Insert(key, value) => {
+                    self.state.lock().await.conn.insert(key, value)?;
+                }
+                Action::Delete(key) => {
+                    self.state.lock().await.conn.remove(key)?;
+                }
+            }
+
+            if let Some(log) = self.state.lock().await.log.get_mut(i) {
+                log.committed = true;
+            }
+        }
+
+        self.state.lock().await.committed_index = new_commit_index;
+
+        Ok(())
     }
 
     async fn reset_heartbeat_timer(&self) {
@@ -324,29 +391,37 @@ impl Skiff {
                 // todo: refactor this block:
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(75)) => {
-
-                        println!("Sending heartbeat");
+                        //println!("Sending heartbeat");
 
                         // todo: move peer connection + sending to separate thread so connection timeout
                         // doesn't result in election timeout
+
+                        let committed_index = self.get_commit_index().await;
+                        let current_term = self.get_current_term().await;
                         for (peer, client) in self.get_peer_clients().await.into_iter() {
-                            let last_log_index = self.get_last_log_index().await;
-                            let last_log_term = self.get_last_log_term().await;
-                            let commited_index = self.get_commit_index().await;
-                            let current_term = self.get_current_term().await;
-                            let entries = self.get_logs(&peer).await;
+                            let (last_log_index, last_log_term, entries) = self.get_logs(&peer).await;
+                            let num_entries = entries.len();
                             let mut request = Request::new(EntryRequest {
                                 term: current_term,
                                 leader_id: self.id,
                                 prev_log_index: last_log_index,
                                 prev_log_term: last_log_term,
                                 entries: entries,
-                                leader_commit: commited_index as u32,
+                                leader_commit: committed_index
                             });
                             request.set_timeout(Duration::from_millis(300));
 
-                            if let Err(_) = client.lock().await.append_entry(request).await {
-                                self.drop_peer_client(peer).await;
+                            match client.lock().await.append_entry(request).await {
+                                Ok(response) => {
+                                    // todo: handle success (committing) and failures (decrement next_index)
+
+                                    //println!("{}", response.into_inner().success);
+                                    //if num_entries > 0 {
+                                    //    println!("{:?}", response)
+                                    //}
+                                    continue
+                                },
+                                Err(_) => { self.drop_peer_client(peer).await; }
                             }
                         }
                     }
@@ -354,7 +429,8 @@ impl Skiff {
             } else {
                 tokio::select! {
                     Some(1) = rx_entries.recv() => {
-                        println!("recv'd heartbeat");
+                        //println!("recv'd heartbeat");
+                        continue;
                     }
 
                     _ = tokio::time::sleep(Duration::from_millis(rng.gen_range(150..300))) => {
@@ -408,27 +484,33 @@ impl Skiff {
             self.set_election_state(ElectionState::Leader).await;
             self.vote_for(None).await;
 
-            //let next_index = match
+            let last_log_index = self.get_last_log_index().await;
+            let last_log_term = self.get_last_log_term().await;
+            let committed_index = self.get_commit_index().await;
+            let current_term = self.get_current_term().await;
 
-            // todo: fix
-            //lock.next_index = HashMap::new();
-            //lock.match_index = HashMap::new();
+            {
+                let peers = self.get_peers().await;
+                let mut lock = self.state.lock().await;
+                lock.next_index = peers
+                    .iter()
+                    .map(|peer| (peer.clone(), last_log_index + 1))
+                    .collect::<HashMap<Ipv4Addr, u32>>();
+                lock.match_index = peers
+                    .into_iter()
+                    .map(|peer| (peer, 0))
+                    .collect::<HashMap<Ipv4Addr, u32>>();
+            }
 
             // Send empty heartbeat
-            // Todo: might want to move this duplicated block to function
-
             for (peer, client) in self.get_peer_clients().await.into_iter() {
-                let last_log_index = self.get_last_log_index().await;
-                let last_log_term = self.get_last_log_term().await;
-                let commited_index = self.get_commit_index().await;
-                let current_term = self.get_current_term().await;
                 let mut request = Request::new(EntryRequest {
                     term: current_term,
                     leader_id: self.id,
                     prev_log_index: last_log_index,
                     prev_log_term: last_log_term,
                     entries: vec![],
-                    leader_commit: commited_index as u32,
+                    leader_commit: committed_index,
                 });
                 request.set_timeout(Duration::from_millis(300));
 
@@ -489,6 +571,7 @@ impl Raft for Skiff {
         &self,
         request: Request<EntryRequest>,
     ) -> Result<Response<EntryReply>, Status> {
+        //println!("recv'd append_entry");
         let entry_request = request.into_inner();
         let current_term = self.get_current_term().await;
         if entry_request.term < current_term {
@@ -498,13 +581,83 @@ impl Raft for Skiff {
             }));
         }
 
+        // Confirmed that we're receiving requests from a verified leader
         self.set_election_state(ElectionState::Follower).await;
         self.vote_for(None).await;
         self.reset_heartbeat_timer().await;
 
-        // todo: check log, make any necessary changes
+        if entry_request.prev_log_index > 0 {
+            // Todo: Probably come up with a more efficient way to do this
+            let mut found_matching_log = false;
+            for log in &self.state.lock().await.log {
+                if log.index == entry_request.prev_log_index
+                    && log.term == entry_request.prev_log_term
+                {
+                    found_matching_log = true;
+                    break;
+                }
+            }
 
-        println!("{:?}", entry_request.entries);
+            if !found_matching_log {
+                return Ok(Response::new(EntryReply {
+                    term: current_term,
+                    success: false,
+                }));
+            }
+        }
+
+        // Todo: Again, probably come up with a better way to do this
+        for new_log in &entry_request.entries {
+            let mut drop_index: Option<u32> = None;
+            for current_log in &self.state.lock().await.log {
+                // Find any conflicting logs where the index matches but the term is different
+                if current_log.index == new_log.index && current_log.term != entry_request.term {
+                    drop_index = Some(current_log.index);
+                }
+            }
+
+            // Drop any logs with index >= drop_index
+            if let Some(drop_index) = drop_index {
+                self.state
+                    .lock()
+                    .await
+                    .log
+                    .retain(|log| log.index < drop_index);
+            }
+        }
+
+        if entry_request.entries.len() > 0 {
+            println!("{:?}", entry_request.entries);
+        }
+
+        let last_log_index = self.get_last_log_index().await;
+
+        // Append new entries to the log
+        for new_log in entry_request.entries {
+            if new_log.index > last_log_index {
+                println!("Adding to log");
+                self.state.lock().await.log.push(Log {
+                    index: new_log.index,
+                    term: entry_request.term,
+                    action: match new_log.action {
+                        // Todo: fix this atrocity. I don't want to hard code i32 values
+                        x if x == raft_proto::Action::Insert as i32 => {
+                            Action::Insert(new_log.key, new_log.value.unwrap())
+                        }
+                        x if x == raft_proto::Action::Delete as i32 => Action::Delete(new_log.key),
+                        _ => return Err(Status::invalid_argument("Invalid action")),
+                    },
+                    committed: false,
+                });
+            }
+        }
+
+        if entry_request.leader_commit > self.get_commit_index().await {
+            println!("Commiting logs");
+            let new_commit_index =
+                min(entry_request.leader_commit, self.get_last_log_index().await);
+            self.commit_logs(new_commit_index).await;
+        }
 
         Ok(Response::new(EntryReply {
             term: current_term,
@@ -530,6 +683,8 @@ impl Raft for Skiff {
 #[tonic::async_trait]
 impl skiff_proto::skiff_server::Skiff for Skiff {
     // Todo: add tree functionality
+    // Todo: forward insert and delete requests to the leader
+
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetReply>, Status> {
         let get_request = request.into_inner();
         let value = self.state.lock().await.conn.get(get_request.key);

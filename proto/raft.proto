@@ -14,9 +14,10 @@ enum Action {
 }
 
 message Log {
-  Action action = 1;
-  string key = 2;
-  optional bytes value = 3;
+  uint32 index = 1;
+  Action action = 2;
+  string key = 3;
+  optional bytes value = 4;
 }
 
 message EntryRequest {
