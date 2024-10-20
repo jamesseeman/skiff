@@ -56,7 +56,7 @@ struct State {
     current_term: u32,
     voted_for: Option<u32>,
     committed_index: u32,
-    last_applied: u32,
+    // last_applied: u32 // This isn't used as commited_index is only set once state machine (sled db) is updated
 
     // todo: potentically separate cluster logic
     cluster: Vec<Ipv4Addr>,
@@ -98,7 +98,6 @@ impl Skiff {
                 current_term: 0,
                 voted_for: None,
                 committed_index: 0,
-                last_applied: 0,
                 cluster: vec![],
                 peer_clients: HashMap::new(),
                 next_index: HashMap::new(),
@@ -139,7 +138,6 @@ impl Skiff {
                 current_term: 0,
                 voted_for: None,
                 committed_index: 0,
-                last_applied: 0,
                 cluster: cluster,
                 peer_clients: HashMap::new(),
                 next_index: HashMap::new(),
@@ -377,6 +375,7 @@ impl Skiff {
         Ok(())
     }
 
+    // todo: rename or break up, as it's handling leader logic as well as elections
     async fn election_manager(&mut self) -> Result<(), anyhow::Error> {
         let mut rng = {
             let rng = rand::thread_rng();
@@ -395,33 +394,61 @@ impl Skiff {
 
                         // todo: move peer connection + sending to separate thread so connection timeout
                         // doesn't result in election timeout
+                        let last_log_index = self.get_last_log_index().await;
 
                         let committed_index = self.get_commit_index().await;
                         let current_term = self.get_current_term().await;
                         for (peer, client) in self.get_peer_clients().await.into_iter() {
-                            let (last_log_index, last_log_term, entries) = self.get_logs(&peer).await;
+                            let (peer_last_log_index, peer_last_log_term, entries) = self.get_logs(&peer).await;
                             let num_entries = entries.len();
                             let mut request = Request::new(EntryRequest {
                                 term: current_term,
                                 leader_id: self.id,
-                                prev_log_index: last_log_index,
-                                prev_log_term: last_log_term,
+                                prev_log_index: peer_last_log_index,
+                                prev_log_term: peer_last_log_term,
                                 entries: entries,
                                 leader_commit: committed_index
                             });
                             request.set_timeout(Duration::from_millis(300));
 
+                            // todo: if response term > current_term, switch to follower, same for request_vote
                             match client.lock().await.append_entry(request).await {
                                 Ok(response) => {
-                                    // todo: handle success (committing) and failures (decrement next_index)
+                                    match response.into_inner().success {
+                                        true => {
+                                            if num_entries > 0 {
+                                                if let Some(value) = self.state.lock().await.next_index.get_mut(&peer) {
+                                                    *value = last_log_index + 1;
+                                                }
 
-                                    //println!("{}", response.into_inner().success);
-                                    //if num_entries > 0 {
-                                    //    println!("{:?}", response)
-                                    //}
-                                    continue
+                                                if let Some(value) = self.state.lock().await.match_index.get_mut(&peer) {
+                                                    *value = last_log_index + 1;
+                                                }
+                                            }
+                                        },
+                                        false => {
+                                            // Decrement next_index for peer
+                                            if let Some(value) = self.state.lock().await.next_index.get_mut(&peer) {
+                                                *value -= 1;
+                                            }
+                                        }
+                                    }
                                 },
                                 Err(_) => { self.drop_peer_client(peer).await; }
+                            }
+                        }
+
+                        // Check if any logs should be commited
+                        // Iterating backwards from last log index to (commited_index + 1)
+
+                        let num_peers = self.state.lock().await.cluster.len();
+                        for i in ((committed_index + 1) ..=last_log_index).rev() {
+                            // The number of peers where at least log index i has been applied (+1 for leader)
+                            let num_peers_applied = self.state.lock().await.match_index.iter().filter(|(_, &applied_index)| applied_index >= i).collect::<Vec<_>>().len() + 1;
+                            let commit = self.state.lock().await.log.iter().filter(|log| log.index == i && log.term != current_term).collect::<Vec<_>>().is_empty();
+                            if commit {
+                                self.commit_logs(i).await;
+                                break                
                             }
                         }
                     }

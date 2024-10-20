@@ -9,7 +9,7 @@ pub async fn main() -> Result<()> {
         "127.0.0.1".parse()?,
     ]);
 
-    println!("{:?}", client.get::<u32>("test", None).await?);
+    println!("{:?}", client.get::<bool>("test", None).await?);
     println!("{:?}", client.insert("test", true, None).await?);
 
     Ok(())
