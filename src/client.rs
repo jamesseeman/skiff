@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use serde::{de::DeserializeOwned, Serialize};
 use tonic::{transport::Channel, Request};
 
-use crate::{error::SkiffError, skiff::skiff_proto::{skiff_client::SkiffClient, GetRequest, InsertRequest}};
+use crate::{error::SkiffError, skiff::skiff_proto::{skiff_client::SkiffClient, DeleteRequest, GetRequest, InsertRequest}};
 
 pub struct Client {
     conn: Option<SkiffClient<Channel>>,
@@ -62,6 +62,22 @@ pub struct Client {
             tree: tree.map(|s| s.to_string()),
             key: key.to_string(),
             value: bincode::serialize(&value)?.to_vec(),
+        })).await;
+
+        match response {
+            Ok(resp) => match resp.into_inner().success {
+                true => Ok(()),
+                false => Err(SkiffError::RPCCallFailed),
+            },
+            Err(_) => Err(SkiffError::RPCCallFailed),
+        }
+    }
+
+    pub async fn remove(&mut self, key: &str, tree: Option<&str>) -> Result<(), SkiffError> {
+        self.connect().await?;
+        let response = self.conn.as_mut().unwrap().delete(Request::new(DeleteRequest {
+            tree: tree.map(|s| s.to_string()),
+            key: key.to_string(),
         })).await;
 
         match response {
