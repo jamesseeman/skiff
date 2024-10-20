@@ -18,15 +18,15 @@ use skiff_proto::{
     skiff_server::SkiffServer, DeleteReply, DeleteRequest, GetReply, GetRequest, InsertReply,
     InsertRequest,
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 use std::{cmp::min, fs};
-use std::{collections::HashMap, thread::current};
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tonic::{transport::Channel, Request, Response, Status};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,12 +35,12 @@ enum Action {
     Delete(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct Log {
     index: u32,
     term: u32,
     action: Action,
-    committed: bool,
+    committed: Arc<(Mutex<bool>, Notify)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -265,18 +265,20 @@ impl Skiff {
         self.state.lock().await.voted_for
     }
 
-    async fn log(&self, action: Action) {
+    async fn log(&self, action: Action) -> Arc<(Mutex<bool>, Notify)> {
         let mut lock = self.state.lock().await;
         let current_term = lock.current_term;
         let last_index = lock.log.last().map(|last: &Log| last.index).unwrap_or(0);
+
+        let commit_pair = Arc::new((Mutex::new(false), Notify::new()));
         lock.log.push(Log {
             index: last_index + 1,
             term: current_term,
             action,
-            committed: false,
+            committed: commit_pair.clone(),
         });
 
-        println!("{:?}", lock.log);
+        commit_pair
     }
 
     async fn get_logs(&self, peer: &Ipv4Addr) -> (u32, u32, Vec<raft_proto::Log>) {
@@ -335,7 +337,9 @@ impl Skiff {
             }
 
             if let Some(log) = self.state.lock().await.log.get_mut(i) {
-                log.committed = true;
+                let (committed, notify) = &*log.committed;
+                *committed.lock().await = true;
+                notify.notify_one();
             }
         }
 
@@ -448,7 +452,7 @@ impl Skiff {
                             let commit = self.state.lock().await.log.iter().filter(|log| log.index == i && log.term != current_term).collect::<Vec<_>>().is_empty();
                             if commit {
                                 self.commit_logs(i).await;
-                                break                
+                                break
                             }
                         }
                     }
@@ -674,7 +678,7 @@ impl Raft for Skiff {
                         x if x == raft_proto::Action::Delete as i32 => Action::Delete(new_log.key),
                         _ => return Err(Status::invalid_argument("Invalid action")),
                     },
-                    committed: false,
+                    committed: Arc::new((Mutex::new(false), Notify::new())),
                 });
             }
         }
@@ -732,9 +736,14 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         request: Request<InsertRequest>,
     ) -> Result<Response<InsertReply>, Status> {
         let insert_request = request.into_inner();
-        self.log(Action::Insert(insert_request.key, insert_request.value))
+        let commit_arc = self
+            .log(Action::Insert(insert_request.key, insert_request.value))
             .await;
 
+        // Wait until the log is committed
+        // Todo: implement timeout
+        let (_, notify) = &*commit_arc;
+        notify.notified().await;
         Ok(Response::new(InsertReply { success: true }))
     }
 
@@ -743,8 +752,12 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteReply>, Status> {
         let delete_request = request.into_inner();
-        self.log(Action::Delete(delete_request.key)).await;
+        let commit_arc = self.log(Action::Delete(delete_request.key)).await;
 
+        // Wait until the log is committed
+        // Todo: implement timeout
+        let (_, notify) = &*commit_arc;
+        notify.notified().await;
         Ok(Response::new(DeleteReply { success: true }))
     }
 }
