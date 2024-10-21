@@ -18,7 +18,7 @@ use skiff_proto::{
     skiff_server::SkiffServer, DeleteReply, DeleteRequest, GetReply, GetRequest, InsertReply,
     InsertRequest,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 use std::path::Path;
 use std::time::Duration;
 use std::{cmp::min, fs};
@@ -28,6 +28,7 @@ use std::{
 };
 use tokio::sync::{mpsc, Mutex, Notify};
 use tonic::{transport::Channel, Request, Response, Status};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Action {
@@ -54,17 +55,17 @@ enum ElectionState {
 struct State {
     election_state: ElectionState,
     current_term: u32,
-    voted_for: Option<u32>,
+    voted_for: Option<Uuid>,
     committed_index: u32,
     // last_applied: u32 // This isn't used as commited_index is only set once state machine (sled db) is updated
 
     // todo: potentically separate cluster logic
-    cluster: Vec<Ipv4Addr>,
-    peer_clients: HashMap<Ipv4Addr, Arc<Mutex<RaftClient<Channel>>>>,
+    cluster: Vec<(Uuid, Ipv4Addr)>,
+    peer_clients: HashMap<Uuid, Arc<Mutex<RaftClient<Channel>>>>,
 
     // todo: potentially separate leader state
-    next_index: HashMap<Ipv4Addr, u32>,
-    match_index: HashMap<Ipv4Addr, u32>,
+    next_index: HashMap<Uuid, u32>,
+    match_index: HashMap<Uuid, u32>,
 
     log: Vec<Log>,
     conn: sled::Tree,
@@ -72,7 +73,7 @@ struct State {
 
 #[derive(Debug, Clone)]
 pub struct Skiff {
-    id: u32,
+    id: Uuid,
     address: Ipv4Addr,
     state: Arc<Mutex<State>>,
     tx_entries: Arc<Mutex<mpsc::Sender<u8>>>,
@@ -80,15 +81,25 @@ pub struct Skiff {
 }
 
 impl Skiff {
-    pub fn new(address: Ipv4Addr) -> Result<Self, SkiffError> {
-        if !Path::new("/tmp/skiff/").exists() {
-            fs::create_dir("/tmp/skiff/")?;
-        }
-
-        let mut rng: rand::prelude::ThreadRng = rand::thread_rng();
-        let id: u32 = rng.gen();
-        let conn = sled::open("/tmp/skiff/")?.open_tree(id.to_string())?;
+    pub fn new(
+        id: Uuid,
+        address: Ipv4Addr,
+        data_dir: String,
+        peers: Vec<Ipv4Addr>,
+    ) -> Result<Self, SkiffError> {
+        let conn = sled::open(data_dir)?.open_tree(id.to_string())?;
         let (tx_entries, rx_entries) = mpsc::channel(32);
+
+        // First convert peers into a vector of tuples (Uuid, Ipv4Addr)
+        // We don't know the actual uuids, we will retrieve them once the server starts
+        // For now, intialize Uuid to 0
+        // Finally add this node to the cluster
+        let mut cluster: Vec<(Uuid, Ipv4Addr)> = peers
+            .into_iter()
+            .map(|addr| (Uuid::from_u128(0), addr))
+            .collect();
+
+        cluster.push((id, address));
 
         Ok(Skiff {
             id,
@@ -98,7 +109,7 @@ impl Skiff {
                 current_term: 0,
                 voted_for: None,
                 committed_index: 0,
-                cluster: vec![],
+                cluster: cluster,
                 peer_clients: HashMap::new(),
                 next_index: HashMap::new(),
                 match_index: HashMap::new(),
@@ -110,15 +121,14 @@ impl Skiff {
         })
     }
 
-    // TODO: cluster: Vec<(Uuid, Ipv4Addr)> or something similar... this for a previously existing cluster
-    pub fn from_cluster(
-        address: Ipv4Addr,
-        cluster: Vec<Ipv4Addr>,
+    /*
+    pub fn from_id(
+        id, u32,
         data_dir: &str,
     ) -> Result<Skiff, SkiffError> {
         cluster
             .iter()
-            .find(|node| **node == address)
+            .find(|(id, addr)| **addr == address)
             .ok_or(SkiffError::InvalidAddress)?;
 
         if !Path::new(data_dir).exists() {
@@ -149,38 +159,43 @@ impl Skiff {
             rx_entries: Arc::new(Mutex::new(rx_entries)),
         })
     }
+    */
 
     // Todo: consider making these macros
+    pub fn get_id(&self) -> Uuid {
+        self.id
+    }
+
     pub fn get_address(&self) -> Ipv4Addr {
         self.address
     }
 
-    async fn get_cluster(&self) -> Vec<Ipv4Addr> {
+    async fn get_cluster(&self) -> Vec<(Uuid, Ipv4Addr)> {
         self.state.lock().await.cluster.clone()
     }
 
-    async fn get_peers(&self) -> Vec<Ipv4Addr> {
+    async fn get_peers(&self) -> Vec<(Uuid, Ipv4Addr)> {
         self.state
             .lock()
             .await
             .cluster
             .clone()
             .into_iter()
-            .filter(|addr| *addr != self.address)
+            .filter(|(_, addr)| *addr != self.address)
             .collect()
     }
 
-    async fn get_peer_clients(&self) -> Vec<(Ipv4Addr, Arc<Mutex<RaftClient<Channel>>>)> {
+    async fn get_peer_clients(&self) -> Vec<(Uuid, Arc<Mutex<RaftClient<Channel>>>)> {
         let peers = self.get_peers().await;
 
         let lock = self.state.lock().await;
         let mut retry = vec![];
-        let mut peer_clients: Vec<(Ipv4Addr, Arc<Mutex<RaftClient<Channel>>>)> = peers
+        let mut peer_clients: Vec<(Uuid, Arc<Mutex<RaftClient<Channel>>>)> = peers
             .into_iter()
-            .filter_map(|addr| match lock.peer_clients.get(&addr) {
-                Some(client) => Some((addr, client.clone())),
+            .filter_map(|(peer_id, peer_addr)| match lock.peer_clients.get(&peer_id) {
+                Some(client) => Some((peer_id, client.clone())),
                 None => {
-                    retry.push(addr);
+                    retry.push((peer_id, peer_addr));
                     None
                 }
             })
@@ -190,12 +205,12 @@ impl Skiff {
         drop(lock);
         let mut lock = self.state.lock().await;
 
-        for peer in retry {
-            match RaftClient::connect(format!("http://{}", SocketAddrV4::new(peer, 9400))).await {
+        for (peer_id, peer_addr) in retry {
+            match RaftClient::connect(format!("http://{}", SocketAddrV4::new(peer_addr, 9400))).await {
                 Ok(client) => {
                     let arc = Arc::new(Mutex::new(client));
-                    lock.peer_clients.insert(peer, arc.clone());
-                    peer_clients.push((peer, arc));
+                    lock.peer_clients.insert(peer_id, arc.clone());
+                    peer_clients.push((peer_id, arc));
                 }
                 Err(_) => {
                     println!("Failed to connect");
@@ -206,9 +221,9 @@ impl Skiff {
         peer_clients
     }
 
-    async fn drop_peer_client(&self, addr: Ipv4Addr) {
+    async fn drop_peer_client(&self, id: &Uuid) {
         let mut lock = self.state.lock().await;
-        let _ = lock.peer_clients.remove(&addr);
+        let _ = lock.peer_clients.remove(id);
     }
 
     async fn get_election_state(&self) -> ElectionState {
@@ -257,11 +272,11 @@ impl Skiff {
         self.state.lock().await.committed_index
     }
 
-    async fn vote_for(&self, candidate_id: Option<u32>) {
+    async fn vote_for(&self, candidate_id: Option<Uuid>) {
         self.state.lock().await.voted_for = candidate_id;
     }
 
-    async fn get_voted_for(&self) -> Option<u32> {
+    async fn get_voted_for(&self) -> Option<Uuid> {
         self.state.lock().await.voted_for
     }
 
@@ -281,7 +296,7 @@ impl Skiff {
         commit_pair
     }
 
-    async fn get_logs(&self, peer: &Ipv4Addr) -> (u32, u32, Vec<raft_proto::Log>) {
+    async fn get_logs(&self, peer: &Uuid) -> (u32, u32, Vec<raft_proto::Log>) {
         let lock = self.state.lock().await;
         let log_next_index = lock.next_index.get(peer).unwrap();
         let mut prev_log_index = 0;
@@ -353,14 +368,6 @@ impl Skiff {
     }
 
     // TODO: Add token for authenticated joins
-    pub fn join_cluster(&self, address: Ipv4Addr) -> Result<(), SkiffError> {
-        Err(SkiffError::ClusterJoinFailed)
-    }
-
-    pub fn init_cluster(&self) -> Result<(), SkiffError> {
-        Ok(())
-    }
-
     pub async fn start(self) -> Result<(), anyhow::Error> {
         let mut server1 = self.clone();
         let _elections: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
@@ -368,6 +375,8 @@ impl Skiff {
                 server1.election_manager().await?;
                 Ok(())
             });
+
+        // check if we're joining an existing cluster
 
         let bind_address = SocketAddr::new(self.get_address().into(), 9400);
         tonic::transport::Server::builder()
@@ -407,7 +416,7 @@ impl Skiff {
                             let num_entries = entries.len();
                             let mut request = Request::new(EntryRequest {
                                 term: current_term,
-                                leader_id: self.id,
+                                leader_id: self.id.to_string(),
                                 prev_log_index: peer_last_log_index,
                                 prev_log_term: peer_last_log_term,
                                 entries: entries,
@@ -438,7 +447,7 @@ impl Skiff {
                                         }
                                     }
                                 },
-                                Err(_) => { self.drop_peer_client(peer).await; }
+                                Err(_) => { self.drop_peer_client(&peer).await; }
                             }
                         }
 
@@ -490,7 +499,7 @@ impl Skiff {
 
             let mut request = Request::new(VoteRequest {
                 term: self.get_current_term().await,
-                candidate_id: self.id,
+                candidate_id: self.id.to_string(),
                 last_log_index: self.get_last_log_index().await,
                 last_log_term: self.get_last_log_term().await,
             });
@@ -499,7 +508,7 @@ impl Skiff {
             let response = match client.lock().await.request_vote(request).await {
                 Ok(response) => response.into_inner(),
                 Err(_) => {
-                    self.drop_peer_client(peer).await;
+                    self.drop_peer_client(&peer).await;
                     continue;
                 }
             };
@@ -525,19 +534,19 @@ impl Skiff {
                 let mut lock = self.state.lock().await;
                 lock.next_index = peers
                     .iter()
-                    .map(|peer| (peer.clone(), last_log_index + 1))
-                    .collect::<HashMap<Ipv4Addr, u32>>();
+                    .map(|(peer_id, _)| (peer_id.clone(), last_log_index + 1))
+                    .collect::<HashMap<Uuid, u32>>();
                 lock.match_index = peers
                     .into_iter()
-                    .map(|peer| (peer, 0))
-                    .collect::<HashMap<Ipv4Addr, u32>>();
+                    .map(|(peer_id, _)| (peer_id, 0))
+                    .collect::<HashMap<Uuid, u32>>();
             }
 
             // Send empty heartbeat
             for (peer, client) in self.get_peer_clients().await.into_iter() {
                 let mut request = Request::new(EntryRequest {
                     term: current_term,
-                    leader_id: self.id,
+                    leader_id: self.id.to_string(),
                     prev_log_index: last_log_index,
                     prev_log_term: last_log_term,
                     entries: vec![],
@@ -546,7 +555,7 @@ impl Skiff {
                 request.set_timeout(Duration::from_millis(300));
 
                 if let Err(_) = client.lock().await.append_entry(request).await {
-                    self.drop_peer_client(peer).await;
+                    self.drop_peer_client(&peer).await;
                 }
             }
         }
@@ -575,14 +584,14 @@ impl Raft for Skiff {
 
         let correct_term = (vote_request.term > current_term && voted_for == Some(self.id))
             || (vote_request.term >= current_term
-                && (voted_for.is_none() || voted_for == Some(vote_request.candidate_id)));
+                && (voted_for.is_none() || voted_for == Some(Uuid::from_str(&vote_request.candidate_id).unwrap())));
 
         if correct_term
             && vote_request.last_log_index >= last_log_index
             && vote_request.last_log_term >= last_log_term
         {
             println!("Voting for {:?}", vote_request.candidate_id);
-            self.vote_for(Some(vote_request.candidate_id)).await;
+            self.vote_for(Some(Uuid::from_str(&vote_request.candidate_id).unwrap())).await;
             self.set_election_state(ElectionState::Follower).await;
             self.set_current_term(vote_request.term).await;
 
