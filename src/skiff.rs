@@ -18,9 +18,8 @@ use skiff_proto::{
     skiff_server::SkiffServer, DeleteReply, DeleteRequest, GetReply, GetRequest, InsertReply,
     InsertRequest,
 };
-use std::path::Path;
+use std::cmp::min;
 use std::time::Duration;
-use std::{cmp::min, fs};
 use std::{collections::HashMap, str::FromStr};
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -804,7 +803,7 @@ impl Raft for Skiff {
             new_server.id,
             Ipv4Addr::from_str(&new_server.address).unwrap(),
         );
-        
+
         if !cluster_config.contains(&server_entry) {
             cluster_config.push(server_entry);
             self.log(Action::Configure(cluster_config.clone())).await;

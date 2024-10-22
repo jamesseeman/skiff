@@ -1,7 +1,5 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use skiff::Skiff;
-use std::net::Ipv4Addr;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MyStruct {
