@@ -104,8 +104,9 @@ impl Skiff {
         // Initialize the log with the cluster
         // Todo: need to consider how this will work once snapshots are implemented, as we'll need
         // to initialize log with old config
-        // By committing setting committed to true, committed_index to 1, and last_applied to 0, we're
-        // ensuring that the cluster config will get committed once the server starts
+        // Todo: at the moment, with committed == last_applied == 0, this first log won't
+        // ever get written to disk. Needs to be resolved. Could be fixed with something like
+        // last_applied = -1, would require changing last_applied to i64
         Ok(Skiff {
             id,
             address,
@@ -113,7 +114,7 @@ impl Skiff {
                 election_state: ElectionState::Follower,
                 current_term: 0,
                 voted_for: None,
-                committed_index: 1,
+                committed_index: 0,
                 last_applied: 0,
                 peer_clients: HashMap::new(),
                 next_index: HashMap::new(),
@@ -130,6 +131,8 @@ impl Skiff {
             rx_entries: Arc::new(Mutex::new(rx_entries)),
         })
     }
+
+    // todo: initializing a new cluster with a known config without needing to send add_server rpc
 
     // todo: something like
     // fn from_id(id: Uuid, data_dir) -> Result<Self, SkifError> {
@@ -310,18 +313,21 @@ impl Skiff {
                 new_logs.push(match &log.action {
                     Action::Insert(key, value) => raft_proto::Log {
                         index: log.index,
+                        term: log.term,
                         action: raft_proto::Action::Insert as i32,
                         key: key.clone(),
                         value: Some(value.clone()),
                     },
                     Action::Delete(key) => raft_proto::Log {
                         index: log.index,
+                        term: log.term,
                         action: raft_proto::Action::Delete as i32,
                         key: key.clone(),
                         value: None,
                     },
                     Action::Configure(config) => raft_proto::Log {
                         index: log.index,
+                        term: log.term,
                         action: raft_proto::Action::Configure as i32,
                         // Todo: obviously can collide with user "cluster" key, need to delineate
                         // The best thing to do would likely be to store in separate tree
@@ -332,6 +338,8 @@ impl Skiff {
                 });
             }
         }
+
+        println!("len: {}", new_logs.len());
 
         (prev_log_index, prev_log_term, new_logs)
     }
@@ -472,7 +480,6 @@ impl Skiff {
                         // todo: move peer connection + sending to separate thread so connection timeout
                         // doesn't result in election timeout
                         let last_log_index = self.get_last_log_index().await;
-
                         let committed_index = self.get_commit_index().await;
                         let current_term = self.get_current_term().await;
                         for (peer, client) in self.get_peer_clients().await.into_iter() {
@@ -500,7 +507,7 @@ impl Skiff {
                                                 }
 
                                                 if let Some(value) = self.state.lock().await.match_index.get_mut(&peer) {
-                                                    *value = last_log_index + 1;
+                                                    *value = last_log_index;
                                                 }
                                             }
                                         },
@@ -518,7 +525,6 @@ impl Skiff {
 
                         // Check if any logs should be commited
                         // Iterating backwards from last log index to (commited_index + 1)
-
                         let num_peers = self.get_cluster().await?.len();
                         for i in ((committed_index + 1) ..=last_log_index).rev() {
                             // The number of peers where at least log index i has been applied (+1 for leader)
@@ -745,7 +751,7 @@ impl Raft for Skiff {
                 println!("Adding to log");
                 self.state.lock().await.log.push(Log {
                     index: new_log.index,
-                    term: entry_request.term,
+                    term: new_log.term,
                     action: match new_log.action {
                         // Todo: fix this atrocity. I don't want to hard code i32 values
                         x if x == raft_proto::Action::Insert as i32 => {
