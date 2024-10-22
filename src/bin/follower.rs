@@ -4,16 +4,23 @@ use std::net::Ipv4Addr;
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
+    let follower = skiff::Builder::new()
+        .set_dir("/tmp/skiff/2")
+        .bind("127.0.0.1".parse()?)
+        .join_cluster(vec!["192.168.5.70".parse()?])
+        .build()?;
 
-    //let mut skiff = Skiff::new("192.168.5.70".parse()?);
-    let mut skiff = Skiff::from_cluster("127.0.0.1".parse()?, vec![
-        "192.168.5.70".parse()?,
-        "127.0.0.1".parse()?,
-    ], "/tmp/skiff/2")?;
+    follower.start().await?;
 
-    println!("{:?}", skiff);
+    //let mut skiff = Skiff::new("192.168.5.70".parse()?, Some("/tmp/skiff/2"))?;
+    // let mut skiff = Skiff::from_cluster("127.0.0.1".parse()?, vec![
+    //     "192.168.5.70".parse()?,
+    //     "127.0.0.1".parse()?,
+    // ], "/tmp/skiff/2")?;
 
-    skiff.start().await?;
+    //println!("{:?}", skiff);
+
+    //skiff.start().await?;
 
     //skiff.join_cluster(Ipv4Addr::from("127.0.0.1".into()))?;
 

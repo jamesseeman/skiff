@@ -25,6 +25,8 @@ pub enum SkiffError {
     SerializeFailed,
     #[error("Insert failed")]
     InsertFailed,
+    #[error("Missing cluster configuration")]
+    MissingClusterConfig,
 }
 
 impl From<tonic::transport::Error> for SkiffError {

@@ -11,6 +11,7 @@ service Raft {
 enum Action {
   INSERT = 0;
   DELETE = 1;
+  CONFIGURE = 2;
 }
 
 message Log {
