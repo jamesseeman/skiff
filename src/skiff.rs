@@ -339,8 +339,6 @@ impl Skiff {
             }
         }
 
-        println!("len: {}", new_logs.len());
-
         (prev_log_index, prev_log_term, new_logs)
     }
 
@@ -406,7 +404,7 @@ impl Skiff {
             let mut joined_cluster = false;
             for (id, client) in self.get_peer_clients().await {
                 println!("Asking {:?} to join cluster", id);
-                
+
                 let mut request = Request::new(ServerRequest {
                     id: self.id.to_string(),
                     address: self.address.to_string(),
@@ -428,7 +426,7 @@ impl Skiff {
 
                                 joined_cluster = true;
 
-                                break
+                                break;
                             }
                         }
                     }
@@ -801,11 +799,23 @@ impl Raft for Skiff {
             .into_iter()
             .map(|(id, addr)| (id.to_string(), addr))
             .collect();
-        cluster_config.push((new_server.id, Ipv4Addr::from_str(&new_server.address).unwrap()));
 
-        self.log(Action::Configure(cluster_config.clone())).await;
+        let server_entry = (
+            new_server.id,
+            Ipv4Addr::from_str(&new_server.address).unwrap(),
+        );
+        
+        if !cluster_config.contains(&server_entry) {
+            cluster_config.push(server_entry);
+            self.log(Action::Configure(cluster_config.clone())).await;
+        }
+
         let last_log_index = self.get_last_log_index().await;
-        self.state.lock().await.next_index.insert(new_uuid, last_log_index + 1);
+        self.state
+            .lock()
+            .await
+            .next_index
+            .insert(new_uuid, last_log_index + 1);
         self.state.lock().await.match_index.insert(new_uuid, 0);
 
         Ok(Response::new(ServerReply {
