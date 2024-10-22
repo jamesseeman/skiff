@@ -92,11 +92,11 @@ impl Skiff {
 
         // First convert peers into a vector of tuples (Uuid, Ipv4Addr)
         // We don't know the actual uuids, we will retrieve them once the server starts
-        // For now, intialize Uuid to 0
+        // For now, intialize with nil Uuids
         // Finally add this node to the cluster
         let mut cluster: Vec<(String, Ipv4Addr)> = peers
             .into_iter()
-            .map(|addr| ("0".to_string(), addr))
+            .map(|addr| (Uuid::nil().to_string(), addr))
             .collect();
 
         cluster.push((id.to_string(), address));
@@ -323,6 +323,9 @@ impl Skiff {
                     Action::Configure(config) => raft_proto::Log {
                         index: log.index,
                         action: raft_proto::Action::Configure as i32,
+                        // Todo: obviously can collide with user "cluster" key, need to delineate
+                        // The best thing to do would likely be to store in separate tree
+                        // The tree would also be delineated from user k/v space
                         key: "cluster".to_string(),
                         value: Some(bincode::serialize(&config).unwrap()),
                     },
@@ -391,7 +394,43 @@ impl Skiff {
         // check if we're joining an existing cluster
         if self.get_cluster().await.unwrap().len() > 1 {
             println!("Joining cluster");
-            todo!()
+
+            let mut joined_cluster = false;
+            for (id, client) in self.get_peer_clients().await {
+                println!("Asking {:?} to join cluster", id);
+                
+                let mut request = Request::new(ServerRequest {
+                    id: self.id.to_string(),
+                    address: self.address.to_string(),
+                });
+
+                request.set_timeout(Duration::from_millis(300));
+
+                match client.lock().await.add_server(request).await {
+                    Ok(response) => {
+                        let inner = response.into_inner();
+                        if inner.success {
+                            if let Some(cluster) = inner.cluster {
+                                // Todo: this will get logged twice. Once here and once from append_entry
+                                // It shouldn't be an issue, but this is an unecessary duplication
+                                self.log(Action::Configure(
+                                    bincode::deserialize(&cluster).unwrap(),
+                                ))
+                                .await;
+
+                                joined_cluster = true;
+
+                                break
+                            }
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            if !joined_cluster {
+                return Err(SkiffError::ClusterJoinFailed.into());
+            }
         }
 
         let mut server1 = self.clone();
@@ -447,6 +486,7 @@ impl Skiff {
                                 entries: entries,
                                 leader_commit: committed_index
                             });
+                            // Todo: see if there's a more idiomatic way to set timeout
                             request.set_timeout(Duration::from_millis(300));
 
                             // todo: if response term > current_term, switch to follower, same for request_vote
@@ -738,11 +778,34 @@ impl Raft for Skiff {
         }))
     }
 
+    // Todo: this should only be called for the leader
+    // We need to handle forwarding to leader
     async fn add_server(
         &self,
         request: Request<ServerRequest>,
     ) -> Result<Response<ServerReply>, Status> {
-        todo!()
+        println!("Adding server to cluster");
+        let new_server = request.into_inner();
+        let new_uuid = Uuid::from_str(&new_server.id).unwrap();
+
+        let mut cluster_config: Vec<(String, Ipv4Addr)> = self
+            .get_cluster()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, addr)| (id.to_string(), addr))
+            .collect();
+        cluster_config.push((new_server.id, Ipv4Addr::from_str(&new_server.address).unwrap()));
+
+        self.log(Action::Configure(cluster_config.clone())).await;
+        let last_log_index = self.get_last_log_index().await;
+        self.state.lock().await.next_index.insert(new_uuid, last_log_index + 1);
+        self.state.lock().await.match_index.insert(new_uuid, 0);
+
+        Ok(Response::new(ServerReply {
+            success: true,
+            cluster: Some(bincode::serialize(&cluster_config).unwrap()),
+        }))
     }
 
     async fn remove_server(

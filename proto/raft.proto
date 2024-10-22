@@ -47,17 +47,12 @@ message VoteReply {
   bool voteGranted = 2;
 }
 
-enum ServerStatus {
-  OK=0;
-  NOT_LEADER=1;
-  TIMEOUT=2;
-}
-
 message ServerRequest {
-  string server = 1;
+  string id = 1;
+  string address = 2;
 }
 
 message ServerReply {
-  ServerStatus status = 1;
-  uint32 leaderHint = 2;
+  bool success = 1;
+  optional bytes cluster = 2;
 }

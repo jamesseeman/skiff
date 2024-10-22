@@ -10,6 +10,7 @@ pub struct Client {
     cluster: Vec<Ipv4Addr>,
 }
  impl Client {
+    // todo: get cluster config
     pub fn new(cluster: Vec<Ipv4Addr>) -> Self {
         Self {
             conn: None,
