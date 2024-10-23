@@ -15,8 +15,8 @@ use raft_proto::{
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use skiff_proto::{
-    skiff_server::SkiffServer, DeleteReply, DeleteRequest, GetReply, GetRequest, InsertReply,
-    InsertRequest,
+    skiff_client::SkiffClient, skiff_server::SkiffServer, DeleteReply, DeleteRequest, GetReply,
+    GetRequest, InsertReply, InsertRequest,
 };
 use std::cmp::min;
 use std::time::Duration;
@@ -59,10 +59,8 @@ struct State {
     committed_index: u32,
     last_applied: u32,
 
-    // todo: potentically separate cluster logic
     peer_clients: HashMap<Uuid, Arc<Mutex<RaftClient<Channel>>>>,
 
-    // todo: potentially separate leader state
     next_index: HashMap<Uuid, u32>,
     match_index: HashMap<Uuid, u32>,
 
@@ -134,7 +132,6 @@ impl Skiff {
     // todo: something like
     // fn from_id(id: Uuid, data_dir) -> Result<Self, SkifError> {
 
-    // Todo: consider making these macros
     pub fn get_id(&self) -> Uuid {
         self.id
     }
@@ -224,6 +221,7 @@ impl Skiff {
         let _ = lock.peer_clients.remove(id);
     }
 
+    // todo: consider making these macros
     async fn get_election_state(&self) -> ElectionState {
         self.state.lock().await.election_state.clone()
     }
@@ -443,7 +441,7 @@ impl Skiff {
                 Ok(())
             });
 
-        let bind_address = SocketAddr::new(self.get_address().into(), 9400);
+        let bind_address = SocketAddr::new(self.address.into(), 9400);
         tonic::transport::Server::builder()
             .add_service(RaftServer::new(self.clone()))
             .add_service(SkiffServer::new(self))
@@ -637,14 +635,12 @@ impl Raft for Skiff {
         &self,
         request: Request<VoteRequest>,
     ) -> Result<Response<VoteReply>, Status> {
-        println!("received request");
+        println!("received vote request");
 
         let current_term = self.get_current_term().await;
         let voted_for = self.get_voted_for().await;
-
-        // todo: get last log index, last log term
-        let last_log_index = 0;
-        let last_log_term = 0;
+        let last_log_index = self.get_last_log_index().await;
+        let last_log_term = self.get_last_log_term().await;
 
         let vote_request = request.into_inner();
 
@@ -660,7 +656,10 @@ impl Raft for Skiff {
             println!("Voting for {:?}", vote_request.candidate_id);
             self.vote_for(Some(Uuid::from_str(&vote_request.candidate_id).unwrap()))
                 .await;
-            self.set_election_state(ElectionState::Follower(Uuid::from_str(&vote_request.candidate_id).unwrap())).await;
+            self.set_election_state(ElectionState::Follower(
+                Uuid::from_str(&vote_request.candidate_id).unwrap(),
+            ))
+            .await;
             self.set_current_term(vote_request.term).await;
 
             return Ok(Response::new(VoteReply {
@@ -690,7 +689,10 @@ impl Raft for Skiff {
         }
 
         // Confirmed that we're receiving requests from a verified leader
-        self.set_election_state(ElectionState::Follower(Uuid::from_str(&entry_request.leader_id).unwrap())).await;
+        self.set_election_state(ElectionState::Follower(
+            Uuid::from_str(&entry_request.leader_id).unwrap(),
+        ))
+        .await;
         self.vote_for(None).await;
         self.reset_heartbeat_timer().await;
 
@@ -734,9 +736,9 @@ impl Raft for Skiff {
             }
         }
 
-        if entry_request.entries.len() > 0 {
-            println!("{:?}", entry_request.entries);
-        }
+        // if entry_request.entries.len() > 0 {
+        //     println!("{:?}", entry_request.entries);
+        // }
 
         let last_log_index = self.get_last_log_index().await;
 
@@ -829,6 +831,33 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
     // Todo: forward insert and delete requests to the leader
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetReply>, Status> {
+        // If follower, connect to leader and forward request     
+        // Todo: ideally get requests could be done locally w/o forwarding, which would improve performance
+        // However, if the client makes an insert or delete request then immediately makes a get request,
+        // the change could have been logged locally and committed by the leader without the change
+        // being made to the state machine (sled) locally (until the subsequent append_entries call), 
+        // resulting in an outdated get. The current workaround is to just forward the request.
+        let election_state = self.state.lock().await.election_state.clone();
+        if let ElectionState::Follower(leader) = election_state {
+            if let Some(leader_addr) = self
+                .get_cluster()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|(id, _)| id == &leader)
+                .map(|(_, addr)| addr)
+            {
+                if let Ok(mut client) =
+                    SkiffClient::connect(format!("http://{}", SocketAddrV4::new(leader_addr, 9400)))
+                        .await
+                {
+                    return client.get(request).await;
+                }
+            }
+
+            return Err(Status::internal("failed to forward request to leader"));
+        }
+
         let get_request = request.into_inner();
         let value = self.state.lock().await.conn.get(get_request.key);
 
@@ -847,6 +876,28 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         &self,
         request: Request<InsertRequest>,
     ) -> Result<Response<InsertReply>, Status> {
+        // If follower, connect to leader and forward request       
+        let election_state = self.state.lock().await.election_state.clone();
+        if let ElectionState::Follower(leader) = election_state {
+            if let Some(leader_addr) = self
+                .get_cluster()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|(id, _)| id == &leader)
+                .map(|(_, addr)| addr)
+            {
+                if let Ok(mut client) =
+                    SkiffClient::connect(format!("http://{}", SocketAddrV4::new(leader_addr, 9400)))
+                        .await
+                {
+                    return client.insert(request).await;
+                }
+            }
+
+            return Err(Status::internal("failed to forward request to leader"));
+        }
+
         let insert_request = request.into_inner();
         let commit_arc = self
             .log(Action::Insert(insert_request.key, insert_request.value))
@@ -863,6 +914,28 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteReply>, Status> {
+        // If follower, connect to leader and forward request
+        let election_state = self.state.lock().await.election_state.clone();
+        if let ElectionState::Follower(leader) = election_state {
+            if let Some(leader_addr) = self
+                .get_cluster()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|(id, _)| id == &leader)
+                .map(|(_, addr)| addr)
+            {
+                if let Ok(mut client) =
+                    SkiffClient::connect(format!("http://{}", SocketAddrV4::new(leader_addr, 9400)))
+                        .await
+                {
+                    return client.delete(request).await;
+                }
+            }
+
+            return Err(Status::internal("failed to forward request to leader"));
+        }
+
         let delete_request = request.into_inner();
         let commit_arc = self.log(Action::Delete(delete_request.key)).await;
 
