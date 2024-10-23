@@ -33,7 +33,7 @@ use uuid::Uuid;
 enum Action {
     Insert(String, Vec<u8>),
     Delete(String),
-    Configure(Vec<(String, Ipv4Addr)>),
+    Configure(Vec<(Uuid, Ipv4Addr)>),
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +48,7 @@ struct Log {
 enum ElectionState {
     Candidate,
     Leader,
-    Follower,
+    Follower(Uuid),
 }
 
 #[derive(Debug, Clone)]
@@ -93,12 +93,10 @@ impl Skiff {
         // We don't know the actual uuids, we will retrieve them once the server starts
         // For now, intialize with nil Uuids
         // Finally add this node to the cluster
-        let mut cluster: Vec<(String, Ipv4Addr)> = peers
-            .into_iter()
-            .map(|addr| (Uuid::nil().to_string(), addr))
-            .collect();
+        let mut cluster: Vec<(Uuid, Ipv4Addr)> =
+            peers.into_iter().map(|addr| (Uuid::nil(), addr)).collect();
 
-        cluster.push((id.to_string(), address));
+        cluster.push((id, address));
 
         // Initialize the log with the cluster
         // Todo: need to consider how this will work once snapshots are implemented, as we'll need
@@ -110,7 +108,7 @@ impl Skiff {
             id,
             address,
             state: Arc::new(Mutex::new(State {
-                election_state: ElectionState::Follower,
+                election_state: ElectionState::Follower(Uuid::nil()),
                 current_term: 0,
                 voted_for: None,
                 committed_index: 0,
@@ -166,7 +164,7 @@ impl Skiff {
 
         Ok(config
             .into_iter()
-            .map(|(id, address)| (Uuid::from_str(&id).unwrap(), address))
+            .map(|(id, address)| (id, address))
             .collect())
     }
 
@@ -662,7 +660,7 @@ impl Raft for Skiff {
             println!("Voting for {:?}", vote_request.candidate_id);
             self.vote_for(Some(Uuid::from_str(&vote_request.candidate_id).unwrap()))
                 .await;
-            self.set_election_state(ElectionState::Follower).await;
+            self.set_election_state(ElectionState::Follower(Uuid::from_str(&vote_request.candidate_id).unwrap())).await;
             self.set_current_term(vote_request.term).await;
 
             return Ok(Response::new(VoteReply {
@@ -692,7 +690,7 @@ impl Raft for Skiff {
         }
 
         // Confirmed that we're receiving requests from a verified leader
-        self.set_election_state(ElectionState::Follower).await;
+        self.set_election_state(ElectionState::Follower(Uuid::from_str(&entry_request.leader_id).unwrap())).await;
         self.vote_for(None).await;
         self.reset_heartbeat_timer().await;
 
@@ -791,16 +789,10 @@ impl Raft for Skiff {
         let new_server = request.into_inner();
         let new_uuid = Uuid::from_str(&new_server.id).unwrap();
 
-        let mut cluster_config: Vec<(String, Ipv4Addr)> = self
-            .get_cluster()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(id, addr)| (id.to_string(), addr))
-            .collect();
+        let mut cluster_config: Vec<(Uuid, Ipv4Addr)> = self.get_cluster().await.unwrap();
 
         let server_entry = (
-            new_server.id,
+            Uuid::from_str(&new_server.id).unwrap(),
             Ipv4Addr::from_str(&new_server.address).unwrap(),
         );
 
