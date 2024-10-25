@@ -65,7 +65,7 @@ struct State {
     match_index: HashMap<Uuid, u32>,
 
     log: Vec<Log>,
-    conn: sled::Tree,
+    conn: sled::Db,
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +84,7 @@ impl Skiff {
         data_dir: String,
         peers: Vec<Ipv4Addr>,
     ) -> Result<Self, SkiffError> {
-        let conn = sled::open(data_dir)?.open_tree(id.to_string())?;
+        let conn = sled::open(data_dir)?;
         let (tx_entries, rx_entries) = mpsc::channel(32);
 
         // First convert peers into a vector of tuples (Uuid, Ipv4Addr)
@@ -324,9 +324,6 @@ impl Skiff {
                         index: log.index,
                         term: log.term,
                         action: raft_proto::Action::Configure as i32,
-                        // Todo: obviously can collide with user "cluster" key, need to delineate
-                        // The best thing to do would likely be to store in separate tree
-                        // The tree would also be delineated from user k/v space
                         key: "cluster".to_string(),
                         value: Some(bincode::serialize(&config).unwrap()),
                     },
@@ -359,10 +356,52 @@ impl Skiff {
         for (i, action) in new_logs {
             match action {
                 Action::Insert(key, value) => {
-                    self.state.lock().await.conn.insert(key, value)?;
+                    let mut tree_parts: Vec<&str> = key.split("/").collect();
+                    tree_parts.pop();
+
+                    let mut tree_name = tree_parts.join("/");
+                    tree_name = match tree_name.len() {
+                        0 => "base".to_string(),
+                        _ => {
+                            self.state
+                                .lock()
+                                .await
+                                .conn
+                                .update_and_fetch("trees", |trees| match trees {
+                                    Some(tree_vec) => {
+                                        let mut updated_tree_vec =
+                                            bincode::deserialize::<Vec<String>>(tree_vec).unwrap();
+
+                                        if !updated_tree_vec.contains(&tree_name) {
+                                            updated_tree_vec.push(tree_name.clone());
+                                        }
+
+                                        Some(bincode::serialize(&updated_tree_vec).unwrap())
+                                    }
+                                    None => Some(bincode::serialize(&vec![&tree_name]).unwrap()),
+                                });
+
+                            format!("base_{}", tree_name.replace("/", "_"))
+                        }
+                    };
+
+                    let tree = self.state.lock().await.conn.open_tree(tree_name)?;
+                    tree.insert(key, value)?;
                 }
                 Action::Delete(key) => {
-                    self.state.lock().await.conn.remove(key)?;
+                    let mut tree_parts: Vec<&str> = key.split("/").collect();
+                    tree_parts.pop();
+
+                    let mut tree_name = tree_parts.join("/");
+                    tree_name = match tree_name.len() {
+                        0 => "base".to_string(),
+                        _ => format!("base_{}", tree_name.replace("/", "_")),
+                    };
+
+                    // Todo: maybe check to see if tree exists. Otherwise a call to delete
+                    // could potentially create a new tree which is unexpected behavior
+                    let tree = self.state.lock().await.conn.open_tree(tree_name)?;
+                    tree.remove(key)?;
                 }
                 Action::Configure(config) => {
                     self.state
@@ -827,15 +866,12 @@ impl Raft for Skiff {
 
 #[tonic::async_trait]
 impl skiff_proto::skiff_server::Skiff for Skiff {
-    // Todo: add tree functionality
-    // Todo: forward insert and delete requests to the leader
-
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetReply>, Status> {
-        // If follower, connect to leader and forward request     
+        // If follower, connect to leader and forward request
         // Todo: ideally get requests could be done locally w/o forwarding, which would improve performance
         // However, if the client makes an insert or delete request then immediately makes a get request,
         // the change could have been logged locally and committed by the leader without the change
-        // being made to the state machine (sled) locally (until the subsequent append_entries call), 
+        // being made to the state machine (sled) locally (until the subsequent append_entries call),
         // resulting in an outdated get. The current workaround is to just forward the request.
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
@@ -859,16 +895,28 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         }
 
         let get_request = request.into_inner();
-        let value = self.state.lock().await.conn.get(get_request.key);
+        let mut tree_parts: Vec<&str> = get_request.key.split("/").collect();
+        tree_parts.pop();
 
-        match value {
-            Ok(inner1) => match inner1 {
-                Some(data) => Ok(Response::new(GetReply {
-                    value: Some(data.to_vec()),
-                })),
-                None => Ok(Response::new(GetReply { value: None })),
-            },
-            Err(_) => Err(Status::internal("failed to query sled db")),
+        let mut tree_name = tree_parts.join("/");
+        tree_name = match tree_name.len() {
+            0 => "base".to_string(),
+            _ => format!("base_{}", tree_name.replace("/", "_")),
+        };
+
+        if let Ok(mut tree) = self.state.lock().await.conn.open_tree(tree_name) {
+            let value = tree.get(get_request.key);
+            match value {
+                Ok(inner1) => match inner1 {
+                    Some(data) => Ok(Response::new(GetReply {
+                        value: Some(data.to_vec()),
+                    })),
+                    None => Ok(Response::new(GetReply { value: None })),
+                },
+                Err(_) => Err(Status::internal("failed to query sled db")),
+            }
+        } else {
+            Err(Status::internal("failed to open sled tree"))
         }
     }
 
@@ -876,7 +924,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         &self,
         request: Request<InsertRequest>,
     ) -> Result<Response<InsertReply>, Status> {
-        // If follower, connect to leader and forward request       
+        // If follower, connect to leader and forward request
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
             if let Some(leader_addr) = self

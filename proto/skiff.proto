@@ -2,7 +2,6 @@ syntax = "proto3";
 package skiff;
 
 message GetRequest {
-  optional string tree = 1;
   string key = 2;
 }
 
@@ -11,9 +10,8 @@ message GetReply {
 }
 
 message InsertRequest {
-  optional string tree = 1;
-  string key = 2;
-  bytes value = 3;
+  string key = 1;
+  bytes value = 2;
 }
 
 message InsertReply {
@@ -21,8 +19,7 @@ message InsertReply {
 }
 
 message DeleteRequest {
-  optional string tree = 1;
-  string key = 2;
+  string key = 1;
 }
 
 message DeleteReply {
