@@ -6,7 +6,7 @@ pub mod skiff_proto {
     tonic::include_proto!("skiff");
 }
 
-use crate::error::SkiffError;
+use crate::error::Error;
 use raft_proto::{
     raft_client::RaftClient,
     raft_server::{Raft, RaftServer},
@@ -83,7 +83,7 @@ impl Skiff {
         address: Ipv4Addr,
         data_dir: String,
         peers: Vec<Ipv4Addr>,
-    ) -> Result<Self, SkiffError> {
+    ) -> Result<Self, Error> {
         let conn = sled::open(data_dir)?;
         let (tx_entries, rx_entries) = mpsc::channel(32);
 
@@ -142,7 +142,7 @@ impl Skiff {
 
     // Todo: consider if this should return result, although there should always be a cluster_config log
     // handle missing cluster configuration? sole node in cluster?
-    async fn get_cluster(&self) -> Result<Vec<(Uuid, Ipv4Addr)>, SkiffError> {
+    async fn get_cluster(&self) -> Result<Vec<(Uuid, Ipv4Addr)>, Error> {
         let config = match self
             .state
             .lock()
@@ -154,9 +154,9 @@ impl Skiff {
         {
             Some(log) => match &log.action {
                 Action::Configure(config) => config.clone(),
-                _ => return Err(SkiffError::MissingClusterConfig),
+                _ => return Err(Error::MissingClusterConfig),
             },
-            _ => return Err(SkiffError::MissingClusterConfig),
+            _ => return Err(Error::MissingClusterConfig),
         };
 
         Ok(config)
@@ -195,6 +195,7 @@ impl Skiff {
         drop(lock);
         let mut lock = self.state.lock().await;
 
+        // Todo: maybe after n failed connection attempts, remove server from cluster
         for (peer_id, peer_addr) in retry {
             match RaftClient::connect(format!("http://{}", SocketAddrV4::new(peer_addr, 9400)))
                 .await
@@ -466,7 +467,7 @@ impl Skiff {
             }
 
             if !joined_cluster {
-                return Err(SkiffError::ClusterJoinFailed.into());
+                return Err(Error::ClusterJoinFailed.into());
             }
         }
 

@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use tonic::{transport::Channel, Request};
 
 use crate::{
-    error::SkiffError,
+    error::Error,
     skiff::skiff_proto::{skiff_client::SkiffClient, DeleteRequest, GetRequest, InsertRequest},
 };
 
@@ -21,7 +21,7 @@ impl Client {
         }
     }
 
-    async fn connect(&mut self) -> Result<(), SkiffError> {
+    async fn connect(&mut self) -> Result<(), Error> {
         if self.conn.is_some() {
             return Ok(());
         }
@@ -36,10 +36,10 @@ impl Client {
             }
         }
 
-        Err(SkiffError::ClientConnectFailed)
+        Err(Error::ClientConnectFailed)
     }
 
-    pub async fn get<T: DeserializeOwned>(&mut self, key: &str) -> Result<Option<T>, SkiffError> {
+    pub async fn get<T: DeserializeOwned>(&mut self, key: &str) -> Result<Option<T>, Error> {
         self.connect().await?;
         let response = self
             .conn
@@ -54,15 +54,15 @@ impl Client {
             Ok(resp) => match resp.into_inner().value {
                 Some(value) => match bincode::deserialize::<T>(value.as_slice()) {
                     Ok(value2) => Ok(Some(value2)),
-                    Err(_) => Err(SkiffError::DeserializeFailed),
+                    Err(_) => Err(Error::DeserializeFailed),
                 },
                 None => Ok(None),
             },
-            Err(_) => Err(SkiffError::RPCCallFailed),
+            Err(_) => Err(Error::RPCCallFailed),
         }
     }
 
-    pub async fn insert<T: Serialize>(&mut self, key: &str, value: T) -> Result<(), SkiffError> {
+    pub async fn insert<T: Serialize>(&mut self, key: &str, value: T) -> Result<(), Error> {
         self.connect().await?;
         let response = self
             .conn
@@ -77,13 +77,13 @@ impl Client {
         match response {
             Ok(resp) => match resp.into_inner().success {
                 true => Ok(()),
-                false => Err(SkiffError::RPCCallFailed),
+                false => Err(Error::RPCCallFailed),
             },
-            Err(_) => Err(SkiffError::RPCCallFailed),
+            Err(_) => Err(Error::RPCCallFailed),
         }
     }
 
-    pub async fn remove(&mut self, key: &str) -> Result<(), SkiffError> {
+    pub async fn remove(&mut self, key: &str) -> Result<(), Error> {
         self.connect().await?;
         let response = self
             .conn
@@ -97,9 +97,9 @@ impl Client {
         match response {
             Ok(resp) => match resp.into_inner().success {
                 true => Ok(()),
-                false => Err(SkiffError::RPCCallFailed),
+                false => Err(Error::RPCCallFailed),
             },
-            Err(_) => Err(SkiffError::RPCCallFailed),
+            Err(_) => Err(Error::RPCCallFailed),
         }
     }
 }
