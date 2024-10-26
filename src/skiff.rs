@@ -159,10 +159,7 @@ impl Skiff {
             _ => return Err(SkiffError::MissingClusterConfig),
         };
 
-        Ok(config
-            .into_iter()
-            .map(|(id, address)| (id, address))
-            .collect())
+        Ok(config)
     }
 
     async fn get_peers(&self) -> Vec<(Uuid, Ipv4Addr)> {
@@ -522,7 +519,7 @@ impl Skiff {
                                 leader_id: self.id.to_string(),
                                 prev_log_index: peer_last_log_index,
                                 prev_log_term: peer_last_log_term,
-                                entries: entries,
+                                entries,
                                 leader_commit: committed_index
                             });
                             // Todo: see if there's a more idiomatic way to set timeout
@@ -637,7 +634,7 @@ impl Skiff {
                 let mut lock = self.state.lock().await;
                 lock.next_index = peers
                     .iter()
-                    .map(|(peer_id, _)| (peer_id.clone(), last_log_index + 1))
+                    .map(|(peer_id, _)| (*peer_id, last_log_index + 1))
                     .collect::<HashMap<Uuid, u32>>();
                 lock.match_index = peers
                     .into_iter()
@@ -788,21 +785,15 @@ impl Raft for Skiff {
                 self.state.lock().await.log.push(Log {
                     index: new_log.index,
                     term: new_log.term,
-                    action: match new_log.action {
-                        // Todo: fix this atrocity. I don't want to hard code i32 values
-                        x if x == raft_proto::Action::Insert as i32 => {
+                    action: match raft_proto::Action::try_from(new_log.action) {
+                        Ok(raft_proto::Action::Insert) => {
                             Action::Insert(new_log.key, new_log.value.unwrap())
                         }
-                        x if x == raft_proto::Action::Delete as i32 => Action::Delete(new_log.key),
-
-                        // Todo: this could be implemented better
-                        // At the moment, we're deserializing it so that get_cluster() can return Vec<Uuid, Ipv4Addr>,
-                        // but we're also deserializing it before it gets serialized again when committed.
-                        // Not a huge deal, but not very efficient
-                        x if x == raft_proto::Action::Configure as i32 => Action::Configure(
+                        Ok(raft_proto::Action::Delete) => Action::Delete(new_log.key),
+                        Ok(raft_proto::Action::Configure) => Action::Configure(
                             bincode::deserialize(&new_log.value.unwrap()).unwrap(),
                         ),
-                        _ => return Err(Status::invalid_argument("Invalid action")),
+                        Err(_) => return Err(Status::invalid_argument("Invalid action")),
                     },
                     committed: Arc::new((Mutex::new(false), Notify::new())),
                 });
@@ -904,7 +895,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
             _ => format!("base_{}", tree_name.replace("/", "_")),
         };
 
-        if let Ok(mut tree) = self.state.lock().await.conn.open_tree(tree_name) {
+        if let Ok(tree) = self.state.lock().await.conn.open_tree(tree_name) {
             let value = tree.get(get_request.key);
             match value {
                 Ok(inner1) => match inner1 {

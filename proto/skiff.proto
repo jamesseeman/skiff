@@ -2,7 +2,7 @@ syntax = "proto3";
 package skiff;
 
 message GetRequest {
-  string key = 2;
+  string key = 1;
 }
 
 message GetReply {

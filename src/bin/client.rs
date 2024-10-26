@@ -27,10 +27,16 @@ pub async fn main() -> Result<()> {
     println!("{:?}", client.get::<MyStruct>("t2").await?);
     println!("{:?}", client.insert("parent/t2", -1).await?);
     println!("{:?}", client.insert("parent/child/t2", 0).await?);
-    println!("{:?}", client.insert("parent/child/grandchild/t2", 1).await?);
+    println!(
+        "{:?}",
+        client.insert("parent/child/grandchild/t2", 1).await?
+    );
     println!("{:?}", client.get::<i32>("parent/t2").await?);
     println!("{:?}", client.get::<i32>("parent/child/t2").await?);
-    println!("{:?}", client.get::<i32>("parent/child/grandchild/t2").await?);
+    println!(
+        "{:?}",
+        client.get::<i32>("parent/child/grandchild/t2").await?
+    );
     println!("{:?}", client.remove("t2").await?);
     println!("{:?}", client.get::<MyStruct>("t2").await?);
 

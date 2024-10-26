@@ -1,6 +1,6 @@
 use crate::{error::SkiffError, Skiff};
-use uuid::Uuid;
 use std::{fs, net::Ipv4Addr, path::Path};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Builder {
@@ -11,6 +11,12 @@ pub struct Builder {
     // If empty, we are the leader of a new cluster
     // Otherwise, we are a follower in an existing cluster
     peers: Vec<Ipv4Addr>,
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Builder {

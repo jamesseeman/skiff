@@ -1,8 +1,8 @@
-mod skiff;
+mod builder;
 mod client;
 mod error;
-mod builder;
+mod skiff;
 
-pub use skiff::Skiff;
-pub use client::Client;
 pub use builder::Builder;
+pub use client::Client;
+pub use skiff::Skiff;
