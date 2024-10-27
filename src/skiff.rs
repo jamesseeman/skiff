@@ -1,23 +1,15 @@
-pub mod raft_proto {
-    tonic::include_proto!("raft");
-}
-
 pub mod skiff_proto {
     tonic::include_proto!("skiff");
 }
 
 use crate::error::Error;
-use raft_proto::{
-    raft_client::RaftClient,
-    raft_server::{Raft, RaftServer},
-    EntryReply, EntryRequest, ServerReply, ServerRequest, VoteReply, VoteRequest,
-};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use skiff_proto::{
     skiff_client::SkiffClient, skiff_server::SkiffServer, DeleteReply, DeleteRequest, GetReply,
     GetRequest, InsertReply, InsertRequest,
 };
+use skiff_proto::{EntryReply, EntryRequest, ServerReply, ServerRequest, VoteReply, VoteRequest};
 use std::cmp::min;
 use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
@@ -59,7 +51,7 @@ struct State {
     committed_index: u32,
     last_applied: u32,
 
-    peer_clients: HashMap<Uuid, Arc<Mutex<RaftClient<Channel>>>>,
+    peer_clients: HashMap<Uuid, Arc<Mutex<SkiffClient<Channel>>>>,
 
     next_index: HashMap<Uuid, u32>,
     match_index: HashMap<Uuid, u32>,
@@ -173,12 +165,12 @@ impl Skiff {
             .collect()
     }
 
-    async fn get_peer_clients(&self) -> Vec<(Uuid, Arc<Mutex<RaftClient<Channel>>>)> {
+    async fn get_peer_clients(&self) -> Vec<(Uuid, Arc<Mutex<SkiffClient<Channel>>>)> {
         let peers = self.get_peers().await;
 
         let lock = self.state.lock().await;
         let mut retry = vec![];
-        let mut peer_clients: Vec<(Uuid, Arc<Mutex<RaftClient<Channel>>>)> = peers
+        let mut peer_clients: Vec<(Uuid, Arc<Mutex<SkiffClient<Channel>>>)> = peers
             .into_iter()
             .filter_map(
                 |(peer_id, peer_addr)| match lock.peer_clients.get(&peer_id) {
@@ -197,7 +189,7 @@ impl Skiff {
 
         // Todo: maybe after n failed connection attempts, remove server from cluster
         for (peer_id, peer_addr) in retry {
-            match RaftClient::connect(format!("http://{}", SocketAddrV4::new(peer_addr, 9400)))
+            match SkiffClient::connect(format!("http://{}", SocketAddrV4::new(peer_addr, 9400)))
                 .await
             {
                 Ok(client) => {
@@ -290,12 +282,12 @@ impl Skiff {
         commit_pair
     }
 
-    async fn get_logs(&self, peer: &Uuid) -> (u32, u32, Vec<raft_proto::Log>) {
+    async fn get_logs(&self, peer: &Uuid) -> (u32, u32, Vec<skiff_proto::Log>) {
         let lock = self.state.lock().await;
         let log_next_index = lock.next_index.get(peer).unwrap();
         let mut prev_log_index = 0;
         let mut prev_log_term = 0;
-        let mut new_logs: Vec<raft_proto::Log> = vec![];
+        let mut new_logs: Vec<skiff_proto::Log> = vec![];
 
         for log in &lock.log {
             // Get latest log that should already be in peer's log
@@ -304,24 +296,24 @@ impl Skiff {
                 prev_log_term = log.term;
             } else if log.index >= *log_next_index {
                 new_logs.push(match &log.action {
-                    Action::Insert(key, value) => raft_proto::Log {
+                    Action::Insert(key, value) => skiff_proto::Log {
                         index: log.index,
                         term: log.term,
-                        action: raft_proto::Action::Insert as i32,
+                        action: skiff_proto::Action::Insert as i32,
                         key: key.clone(),
                         value: Some(value.clone()),
                     },
-                    Action::Delete(key) => raft_proto::Log {
+                    Action::Delete(key) => skiff_proto::Log {
                         index: log.index,
                         term: log.term,
-                        action: raft_proto::Action::Delete as i32,
+                        action: skiff_proto::Action::Delete as i32,
                         key: key.clone(),
                         value: None,
                     },
-                    Action::Configure(config) => raft_proto::Log {
+                    Action::Configure(config) => skiff_proto::Log {
                         index: log.index,
                         term: log.term,
-                        action: raft_proto::Action::Configure as i32,
+                        action: skiff_proto::Action::Configure as i32,
                         key: "cluster".to_string(),
                         value: Some(bincode::serialize(&config).unwrap()),
                     },
@@ -426,62 +418,74 @@ impl Skiff {
         let _ = self.tx_entries.lock().await.send(1).await; // Can be anything
     }
 
-    // Todo: Add token for authenticated joins
-    // Todo: snapshot / log compaction, resuming operation after restart
-    pub async fn start(self) -> Result<(), anyhow::Error> {
-        // check if we're joining an existing cluster
-        if self.get_cluster().await.unwrap().len() > 1 {
-            println!("Joining cluster");
+    // Todo: consider making this async, waiting for cluster join to finish
+    pub fn initialize_service(&self) -> SkiffServer<Skiff> {
+        let skiff = self.clone();
+        let _: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+            // check if we're joining an existing cluster
+            if skiff.get_cluster().await.unwrap().len() > 1 {
+                println!("Joining cluster");
 
-            let mut joined_cluster = false;
-            for (id, client) in self.get_peer_clients().await {
-                println!("Asking {:?} to join cluster", id);
+                let mut joined_cluster = false;
+                for (id, client) in skiff.get_peer_clients().await {
+                    println!("Asking {:?} to join cluster", id);
 
-                let mut request = Request::new(ServerRequest {
-                    id: self.id.to_string(),
-                    address: self.address.to_string(),
-                });
+                    let mut request = Request::new(ServerRequest {
+                        id: skiff.id.to_string(),
+                        address: skiff.address.to_string(),
+                    });
 
-                request.set_timeout(Duration::from_millis(300));
+                    request.set_timeout(Duration::from_millis(300));
 
-                match client.lock().await.add_server(request).await {
-                    Ok(response) => {
-                        let inner = response.into_inner();
-                        if inner.success {
-                            if let Some(cluster) = inner.cluster {
-                                // Todo: this will get logged twice. Once here and once from append_entry
-                                // It shouldn't be an issue, but this is an unecessary duplication
-                                self.log(Action::Configure(
-                                    bincode::deserialize(&cluster).unwrap(),
-                                ))
-                                .await;
+                    match client.lock().await.add_server(request).await {
+                        Ok(response) => {
+                            let inner = response.into_inner();
+                            if inner.success {
+                                if let Some(cluster) = inner.cluster {
+                                    // Todo: this will get logged twice. Once here and once from append_entry
+                                    // It shouldn't be an issue, but this is an unecessary duplication
+                                    skiff
+                                        .log(Action::Configure(
+                                            bincode::deserialize(&cluster).unwrap(),
+                                        ))
+                                        .await;
 
-                                joined_cluster = true;
+                                    joined_cluster = true;
 
-                                break;
+                                    break;
+                                }
                             }
                         }
+                        Err(_) => continue,
                     }
-                    Err(_) => continue,
+                }
+
+                if !joined_cluster {
+                    return Err(Error::ClusterJoinFailed.into());
                 }
             }
 
-            if !joined_cluster {
-                return Err(Error::ClusterJoinFailed.into());
-            }
-        }
+            let mut server1 = skiff.clone();
+            let _elections: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
+                tokio::spawn(async move {
+                    server1.election_manager().await?;
+                    Ok(())
+                });
 
-        let mut server1 = self.clone();
-        let _elections: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
-            tokio::spawn(async move {
-                server1.election_manager().await?;
-                Ok(())
-            });
+            Ok(())
+        });
+
+        SkiffServer::new(self.clone())
+    }
+
+    // Todo: Add token for authenticated joins
+    // Todo: snapshot / log compaction, resuming operation after restart
+    pub async fn start(self) -> Result<(), anyhow::Error> {
+        let service = self.initialize_service();
 
         let bind_address = SocketAddr::new(self.address.into(), 9400);
         tonic::transport::Server::builder()
-            .add_service(RaftServer::new(self.clone()))
-            .add_service(SkiffServer::new(self))
+            .add_service(service)
             .serve(bind_address)
             .await?;
 
@@ -667,7 +671,7 @@ impl Skiff {
 
 // todo: access control. checking if id matches leaderid, if request comes from within cluster, etc
 #[tonic::async_trait]
-impl Raft for Skiff {
+impl skiff_proto::skiff_server::Skiff for Skiff {
     async fn request_vote(
         &self,
         request: Request<VoteRequest>,
@@ -786,12 +790,12 @@ impl Raft for Skiff {
                 self.state.lock().await.log.push(Log {
                     index: new_log.index,
                     term: new_log.term,
-                    action: match raft_proto::Action::try_from(new_log.action) {
-                        Ok(raft_proto::Action::Insert) => {
+                    action: match skiff_proto::Action::try_from(new_log.action) {
+                        Ok(skiff_proto::Action::Insert) => {
                             Action::Insert(new_log.key, new_log.value.unwrap())
                         }
-                        Ok(raft_proto::Action::Delete) => Action::Delete(new_log.key),
-                        Ok(raft_proto::Action::Configure) => Action::Configure(
+                        Ok(skiff_proto::Action::Delete) => Action::Delete(new_log.key),
+                        Ok(skiff_proto::Action::Configure) => Action::Configure(
                             bincode::deserialize(&new_log.value.unwrap()).unwrap(),
                         ),
                         Err(_) => return Err(Status::invalid_argument("Invalid action")),
@@ -854,10 +858,7 @@ impl Raft for Skiff {
     ) -> Result<Response<ServerReply>, Status> {
         todo!()
     }
-}
 
-#[tonic::async_trait]
-impl skiff_proto::skiff_server::Skiff for Skiff {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetReply>, Status> {
         // If follower, connect to leader and forward request
         // Todo: ideally get requests could be done locally w/o forwarding, which would improve performance
@@ -867,20 +868,14 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         // resulting in an outdated get. The current workaround is to just forward the request.
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
-            if let Some(leader_addr) = self
-                .get_cluster()
+            let client = self
+                .get_peer_clients()
                 .await
-                .unwrap()
                 .into_iter()
-                .find(|(id, _)| id == &leader)
-                .map(|(_, addr)| addr)
-            {
-                if let Ok(mut client) =
-                    SkiffClient::connect(format!("http://{}", SocketAddrV4::new(leader_addr, 9400)))
-                        .await
-                {
-                    return client.get(request).await;
-                }
+                .find(|(id, _)| *id == leader)
+                .map(|(_, client)| client);
+            if let Some(client_inner) = client {
+                return client_inner.lock().await.get(request).await;
             }
 
             return Err(Status::internal("failed to forward request to leader"));
@@ -919,20 +914,14 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         // If follower, connect to leader and forward request
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
-            if let Some(leader_addr) = self
-                .get_cluster()
+            let client = self
+                .get_peer_clients()
                 .await
-                .unwrap()
                 .into_iter()
-                .find(|(id, _)| id == &leader)
-                .map(|(_, addr)| addr)
-            {
-                if let Ok(mut client) =
-                    SkiffClient::connect(format!("http://{}", SocketAddrV4::new(leader_addr, 9400)))
-                        .await
-                {
-                    return client.insert(request).await;
-                }
+                .find(|(id, _)| *id == leader)
+                .map(|(_, client)| client);
+            if let Some(client_inner) = client {
+                return client_inner.lock().await.insert(request).await;
             }
 
             return Err(Status::internal("failed to forward request to leader"));
@@ -957,20 +946,14 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         // If follower, connect to leader and forward request
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
-            if let Some(leader_addr) = self
-                .get_cluster()
+            let client = self
+                .get_peer_clients()
                 .await
-                .unwrap()
                 .into_iter()
-                .find(|(id, _)| id == &leader)
-                .map(|(_, addr)| addr)
-            {
-                if let Ok(mut client) =
-                    SkiffClient::connect(format!("http://{}", SocketAddrV4::new(leader_addr, 9400)))
-                        .await
-                {
-                    return client.delete(request).await;
-                }
+                .find(|(id, _)| *id == leader)
+                .map(|(_, client)| client);
+            if let Some(client_inner) = client {
+                return client_inner.lock().await.delete(request).await;
             }
 
             return Err(Status::internal("failed to forward request to leader"));
