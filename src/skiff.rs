@@ -394,15 +394,10 @@ impl Skiff {
                         _ => format!("base_{}", tree_name.replace("/", "_")),
                     };
 
-                    match self.state.lock().await.conn.get("trees") {
-                        Ok(Some(tree_vec)) => {
-                            let trees = bincode::deserialize::<Vec<String>>(&tree_vec).unwrap();
-                            if trees.contains(&tree_name) {
-                                let tree = self.state.lock().await.conn.open_tree(tree_name)?;
-                                tree.remove(key)?;
-                            }
-                        }
-                        _ => continue,
+                    let trees = self.state.lock().await.conn.tree_names();
+                    if trees.contains(&tree_name.as_bytes().into()) {
+                        let tree = self.state.lock().await.conn.open_tree(tree_name)?;
+                        tree.remove(key)?;
                     }
                 }
                 Action::Configure(config) => {
@@ -890,6 +885,12 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
     ) -> Result<Response<ServerReply>, Status> {
         todo!()
     }
+
+    // Todo:
+    // pub async fn get_trees() or get_prefixes
+
+    // Todo: maybe add watch_prefix function that communicates changes to clients
+    // Todo: maybe add something like get() with a prefix to get keys + trees under prefix
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetReply>, Status> {
         // If follower, connect to leader and forward request

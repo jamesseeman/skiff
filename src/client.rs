@@ -8,12 +8,13 @@ use crate::{
     skiff::skiff_proto::{skiff_client::SkiffClient, DeleteRequest, GetRequest, InsertRequest},
 };
 
+#[derive(Debug)]
 pub struct Client {
     conn: Option<SkiffClient<Channel>>,
     cluster: Vec<Ipv4Addr>,
 }
 impl Client {
-    // todo: get cluster config
+    // todo: get cluster config from server
     pub fn new(cluster: Vec<Ipv4Addr>) -> Self {
         Self {
             conn: None,
@@ -21,7 +22,7 @@ impl Client {
         }
     }
 
-    async fn connect(&mut self) -> Result<(), Error> {
+    pub async fn connect(&mut self) -> Result<(), Error> {
         if self.conn.is_some() {
             return Ok(());
         }
