@@ -69,6 +69,12 @@ pub struct Skiff {
     rx_entries: Arc<Mutex<mpsc::Receiver<u8>>>,
 }
 
+// Todo: env logging
+// Todo: add clap, cli params
+// Todo: add configuration parameters for
+// - when to drop unresponsive peer
+// - threshold for automatically snapshotting
+// and add corresponding functionality
 impl Skiff {
     pub fn new(
         id: Uuid,
@@ -388,12 +394,19 @@ impl Skiff {
                         _ => format!("base_{}", tree_name.replace("/", "_")),
                     };
 
-                    // Todo: maybe check to see if tree exists. Otherwise a call to delete
-                    // could potentially create a new tree which is unexpected behavior
-                    let tree = self.state.lock().await.conn.open_tree(tree_name)?;
-                    tree.remove(key)?;
+                    match self.state.lock().await.conn.get("trees") {
+                        Ok(Some(tree_vec)) => {
+                            let trees = bincode::deserialize::<Vec<String>>(&tree_vec).unwrap();
+                            if trees.contains(&tree_name) {
+                                let tree = self.state.lock().await.conn.open_tree(tree_name)?;
+                                tree.remove(key)?;
+                            }
+                        }
+                        _ => continue,
+                    }
                 }
                 Action::Configure(config) => {
+                    // Todo: also save committed_index and last_applied for resuming operation later
                     self.state
                         .lock()
                         .await
