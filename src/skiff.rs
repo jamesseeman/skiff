@@ -435,7 +435,10 @@ impl Skiff {
     pub fn initialize_service(&self) -> SkiffServer<Skiff> {
         let skiff = self.clone();
         let _: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
-            // check if we're joining an existing cluster
+            // Todo: when we're restoring a cluster from previous operation (ex. after outage / migration)
+            // the cluster len for all nodes will be > 1, but no leader exists yet, so add_server rpc fails.
+            // Might be ok if leader election happens subsequently, but this should a) be verified
+            // and b) logic for this scenario should be made obvious
             if skiff.get_cluster().await.unwrap().len() > 1 {
                 println!("Joining cluster");
 
@@ -835,6 +838,21 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         &self,
         request: Request<ServerRequest>,
     ) -> Result<Response<ServerReply>, Status> {
+        let election_state = self.state.lock().await.election_state.clone();
+        if let ElectionState::Follower(leader) = election_state {
+            let client = self
+                .get_peer_clients()
+                .await
+                .into_iter()
+                .find(|(id, _)| *id == leader)
+                .map(|(_, client)| client);
+            if let Some(client_inner) = client {
+                return client_inner.lock().await.add_server(request).await;
+            }
+
+            return Err(Status::internal("failed to forward request to leader"));
+        }
+
         println!("Adding server to cluster");
         let new_server = request.into_inner();
         let new_uuid = Uuid::from_str(&new_server.id).unwrap();
@@ -865,6 +883,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         }))
     }
 
+    // Todo: no part of the program calls this yet
     async fn remove_server(
         &self,
         request: Request<ServerRequest>,
