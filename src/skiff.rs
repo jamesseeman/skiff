@@ -76,6 +76,8 @@ pub struct Skiff {
 // - threshold for automatically snapshotting
 // and add corresponding functionality
 // Todo: allow custom port, swap out Ipv4Addr w SocketAddr where appropriate
+// Todo: docs
+// Todo: publish to crates.io
 impl Skiff {
     pub fn new(
         id: Uuid,
@@ -137,6 +139,24 @@ impl Skiff {
 
     pub fn get_address(&self) -> Ipv4Addr {
         self.address
+    }
+
+    // This was named is_ready, but is_leader_elected is more accurate
+    // Consider renaming to is_ready as that's what we're trying to evaluate.
+    //  should consider logic further
+    pub async fn is_leader_elected(&self) -> bool {
+        let election_state = self.get_election_state().await;
+        match election_state {
+            ElectionState::Leader => true,
+            ElectionState::Candidate => false,
+            ElectionState::Follower(id) => {
+                if Uuid::nil() == id {
+                    return false;
+                }
+
+                true
+            }
+        }
     }
 
     // Todo: consider if this should return result, although there should always be a cluster_config log
@@ -828,8 +848,6 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         }))
     }
 
-    // Todo: this should only be called for the leader
-    // We need to handle forwarding to leader
     async fn add_server(
         &self,
         request: Request<ServerRequest>,
@@ -893,8 +911,8 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
     // Todo: maybe add watch_prefix function that communicates changes to clients
     // Todo: maybe add something like get() with a prefix to get keys + trees under prefix
 
-    // Todo: Forwarding to the leader fails when... there is no leader. This is an issue
-    // when calling add_server from a follower to a server before the latter has elected itself
+    // Todo: Forwarding to the leader fails when... there is no leader, or when we are a candiate
+    // This is an issue when calling add_server from a follower to a server before the latter has elected itself
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetReply>, Status> {
         // If follower, connect to leader and forward request

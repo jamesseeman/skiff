@@ -40,8 +40,21 @@ async fn start_server() {
     let handle = tokio::spawn(async move {
         let _ = leader.start().await;
     });
+}
 
-    println!("ok");
+#[tokio::test]
+#[serial]
+async fn leader_election() {
+    let leader = get_leader().unwrap();
+    let leader_clone = leader.clone();
+    let handle = tokio::spawn(async move {
+        let _ = leader_clone.start().await;
+    });
+
+    assert!(!(leader.is_leader_elected().await));
+    // Give leader time to elect itself
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    assert!(leader.is_leader_elected().await);
 }
 
 #[tokio::test]
