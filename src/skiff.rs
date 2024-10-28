@@ -75,6 +75,7 @@ pub struct Skiff {
 // - when to drop unresponsive peer
 // - threshold for automatically snapshotting
 // and add corresponding functionality
+// Todo: allow custom port, swap out Ipv4Addr w SocketAddr where appropriate
 impl Skiff {
     pub fn new(
         id: Uuid,
@@ -140,7 +141,7 @@ impl Skiff {
 
     // Todo: consider if this should return result, although there should always be a cluster_config log
     // handle missing cluster configuration? sole node in cluster?
-    async fn get_cluster(&self) -> Result<Vec<(Uuid, Ipv4Addr)>, Error> {
+    pub async fn get_cluster(&self) -> Result<Vec<(Uuid, Ipv4Addr)>, Error> {
         let config = match self
             .state
             .lock()
@@ -891,6 +892,9 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
 
     // Todo: maybe add watch_prefix function that communicates changes to clients
     // Todo: maybe add something like get() with a prefix to get keys + trees under prefix
+
+    // Todo: Forwarding to the leader fails when... there is no leader. This is an issue
+    // when calling add_server from a follower to a server before the latter has elected itself
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetReply>, Status> {
         // If follower, connect to leader and forward request

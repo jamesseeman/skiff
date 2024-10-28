@@ -2,9 +2,17 @@ use serial_test::serial;
 use skiff::Client;
 use skiff::Skiff;
 
-fn get_skiff(address: &str) -> Result<Skiff, anyhow::Error> {
+fn get_leader() -> Result<Skiff, anyhow::Error> {
     Ok(skiff::Builder::new()
-        .set_dir("/tmp/test/")
+        .set_dir("/tmp/test/127.0.0.1")
+        .bind("127.0.0.1".parse()?)
+        .build()?)
+}
+
+fn get_follower(address: &str) -> Result<Skiff, anyhow::Error> {
+    Ok(skiff::Builder::new()
+        .set_dir(format!("/tmp/test/{}", &address).as_str())
+        .join_cluster(vec!["127.0.0.1".parse()?])
         .bind(address.parse()?)
         .build()?)
 }
@@ -28,7 +36,7 @@ async fn get_client() -> Result<Client, anyhow::Error> {
 #[tokio::test]
 #[serial]
 async fn start_server() {
-    let leader = get_skiff("127.0.0.1").unwrap();
+    let leader = get_leader().unwrap();
     let handle = tokio::spawn(async move {
         let _ = leader.start().await;
     });
@@ -39,7 +47,7 @@ async fn start_server() {
 #[tokio::test]
 #[serial]
 async fn client_get() {
-    let leader = get_skiff("127.0.0.1").unwrap();
+    let leader = get_leader().unwrap();
     let handle = tokio::spawn(async move {
         let _ = leader.start().await;
     });
@@ -51,7 +59,7 @@ async fn client_get() {
 #[tokio::test]
 #[serial]
 async fn client_insert() {
-    let leader = get_skiff("127.0.0.1").unwrap();
+    let leader = get_leader().unwrap();
     let handle = tokio::spawn(async move {
         let _ = leader.start().await;
     });
@@ -67,7 +75,7 @@ async fn client_insert() {
 #[tokio::test]
 #[serial]
 async fn client_remove() {
-    let leader = get_skiff("127.0.0.1").unwrap();
+    let leader = get_leader().unwrap();
     let handle = tokio::spawn(async move {
         let _ = leader.start().await;
     });
@@ -83,4 +91,32 @@ async fn client_remove() {
     );
     client.remove("foo2").await.unwrap();
     assert_eq!(None, client.get::<String>("foo2").await.unwrap());
+}
+
+#[tokio::test]
+#[serial]
+async fn two_node_cluster() {
+    let leader = get_leader().unwrap();
+    let leader_clone = leader.clone();
+    let handle = tokio::spawn(async move {
+        let _ = leader_clone.start().await;
+    });
+
+    // Give leader time to elect itself
+    // Todo: again, need more reliable method for determining when servers are ready
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let follower = get_follower("127.0.0.2").unwrap();
+    let follower_clone = follower.clone();
+    let _ = tokio::spawn(async move {
+        let _ = follower_clone.start().await;
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let leader_cluster = leader.get_cluster().await.unwrap();
+    let follower_cluster = follower.get_cluster().await.unwrap();
+
+    assert_eq!(leader_cluster, follower_cluster);
+    assert_eq!(2, leader_cluster.len());
 }

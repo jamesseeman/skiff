@@ -4,7 +4,7 @@ use anyhow::Result;
 pub async fn main() -> Result<()> {
     let leader = skiff::Builder::new()
         .set_dir("/tmp/skiff/1")
-        .bind("192.168.5.70".parse()?)
+        .bind("127.0.0.1".parse()?)
         .build()?;
 
     leader.start().await?;

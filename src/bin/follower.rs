@@ -4,8 +4,8 @@ use anyhow::Result;
 pub async fn main() -> Result<()> {
     let follower = skiff::Builder::new()
         .set_dir("/tmp/skiff/2")
-        .bind("127.0.0.1".parse()?)
-        .join_cluster(vec!["192.168.5.70".parse()?])
+        .bind("127.0.0.2".parse()?)
+        .join_cluster(vec!["127.0.0.1".parse()?])
         .build()?;
 
     follower.start().await?;
