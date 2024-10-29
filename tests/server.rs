@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serial_test::serial;
 use skiff::Client;
 use skiff::Skiff;
@@ -132,4 +133,49 @@ async fn two_node_cluster() {
 
     assert_eq!(leader_cluster, follower_cluster);
     assert_eq!(2, leader_cluster.len());
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+struct MyStruct {
+    enabled: bool,
+    name: String,
+    age: u8,
+    height: f32,
+}
+
+#[tokio::test]
+#[serial]
+async fn custom_struct() {
+    let leader = get_leader().unwrap();
+    let leader_clone = leader.clone();
+    let handle = tokio::spawn(async move {
+        let _ = leader_clone.start().await;
+    });
+
+    let my_struct = MyStruct {
+        enabled: true,
+        name: "foo".into(),
+        age: 100,
+        height: 32.456789,
+    };
+
+    // Give leader time to elect itself
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    let mut client = get_client().await.unwrap();
+    assert_eq!(None, client.get::<MyStruct>("mystruct").await.unwrap());
+
+    // Insert and check
+    client
+        .insert::<MyStruct>("mystruct", my_struct.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        Some(my_struct),
+        client.get::<MyStruct>("mystruct").await.unwrap()
+    );
+
+    // Delete
+    client.remove("mystruct").await.unwrap();
+    assert_eq!(None, client.get::<MyStruct>("mystruct").await.unwrap());
 }
