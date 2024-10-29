@@ -1,18 +1,31 @@
+use std::fs;
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serial_test::serial;
 use skiff::Client;
 use skiff::Skiff;
 
 fn get_leader() -> Result<Skiff, anyhow::Error> {
+    let dir = String::from("target/tmp/test/127.0.0.1");
+    if Path::exists(Path::new(&dir)) {
+        fs::remove_dir_all(&dir)?;
+    }
+
     Ok(skiff::Builder::new()
-        .set_dir("/tmp/test/127.0.0.1")
+        .set_dir(dir.as_str())
         .bind("127.0.0.1".parse()?)
         .build()?)
 }
 
 fn get_follower(address: &str) -> Result<Skiff, anyhow::Error> {
+    let dir = format!("target/tmp/test/{}", &address);
+    if Path::exists(Path::new(&dir)) {
+        fs::remove_dir_all(&dir)?;
+    }
+
     Ok(skiff::Builder::new()
-        .set_dir(format!("/tmp/test/{}", &address).as_str())
+        .set_dir(dir.as_str())
         .join_cluster(vec!["127.0.0.1".parse()?])
         .bind(address.parse()?)
         .build()?)
@@ -159,9 +172,6 @@ async fn custom_struct() {
         height: 32.456789,
     };
 
-    // Give leader time to elect itself
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
     let mut client = get_client().await.unwrap();
     assert_eq!(None, client.get::<MyStruct>("mystruct").await.unwrap());
 
@@ -178,4 +188,26 @@ async fn custom_struct() {
     // Delete
     client.remove("mystruct").await.unwrap();
     assert_eq!(None, client.get::<MyStruct>("mystruct").await.unwrap());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_prefixes() {
+    let leader = get_leader().unwrap();
+    let leader_clone = leader.clone();
+    let handle = tokio::spawn(async move {
+        let _ = leader_clone.start().await;
+    });
+
+    assert_eq!(Vec::<String>::new(), leader.get_prefixes().await.unwrap());
+    let mut client = get_client().await.unwrap();
+    client.insert::<String>("parent/foo", "bar".into()).await;
+    assert_eq!(vec!["parent"], leader.get_prefixes().await.unwrap());
+    client
+        .insert::<String>("grandparent/parent/foo", "bar".into())
+        .await;
+    assert_eq!(
+        vec!["parent", "grandparent/parent"],
+        leader.get_prefixes().await.unwrap()
+    );
 }

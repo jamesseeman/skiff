@@ -309,6 +309,17 @@ impl Skiff {
         commit_pair
     }
 
+    // Todo: add this to RPC server + client
+    pub async fn get_prefixes(&self) -> Result<Vec<String>, Error> {
+        match self.state.lock().await.conn.get("trees")? {
+            Some(tree_vec) => match bincode::deserialize::<Vec<String>>(&tree_vec) {
+                Ok(trees) => Ok(trees),
+                Err(_) => Err(Error::DeserializeFailed),
+            },
+            None => Ok(vec![]),
+        }
+    }
+
     async fn get_logs(&self, peer: &Uuid) -> (u32, u32, Vec<skiff_proto::Log>) {
         let lock = self.state.lock().await;
         let log_next_index = lock.next_index.get(peer).unwrap();
@@ -415,6 +426,7 @@ impl Skiff {
                         _ => format!("base_{}", tree_name.replace("/", "_")),
                     };
 
+                    // Todo: delete tree if it's now empty
                     let trees = self.state.lock().await.conn.tree_names();
                     if trees.contains(&tree_name.as_bytes().into()) {
                         let tree = self.state.lock().await.conn.open_tree(tree_name)?;
@@ -904,9 +916,6 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
     ) -> Result<Response<ServerReply>, Status> {
         todo!()
     }
-
-    // Todo:
-    // pub async fn get_trees() or get_prefixes
 
     // Todo: maybe add watch_prefix function that communicates changes to clients
     // Todo: maybe add something like get() with a prefix to get keys + trees under prefix

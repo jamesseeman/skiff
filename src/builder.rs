@@ -1,5 +1,5 @@
 use crate::{error::Error, Skiff};
-use std::{fs, net::Ipv4Addr, path::Path};
+use std::net::Ipv4Addr;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -55,10 +55,6 @@ impl Builder {
     }
 
     pub fn build(self) -> Result<Skiff, Error> {
-        if !Path::new(&self.data_dir).exists() {
-            fs::create_dir(&self.data_dir)?;
-        }
-
         Skiff::new(self.id, self.bind_address, self.data_dir, self.peers)
     }
 }
