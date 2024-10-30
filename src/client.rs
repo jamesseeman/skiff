@@ -5,7 +5,9 @@ use tonic::{transport::Channel, Request};
 
 use crate::{
     error::Error,
-    skiff::skiff_proto::{skiff_client::SkiffClient, DeleteRequest, GetRequest, InsertRequest},
+    skiff::skiff_proto::{
+        skiff_client::SkiffClient, DeleteRequest, Empty, GetRequest, InsertRequest, ListKeysRequest,
+    },
 };
 
 #[derive(Debug)]
@@ -100,6 +102,38 @@ impl Client {
                 true => Ok(()),
                 false => Err(Error::RPCCallFailed),
             },
+            Err(_) => Err(Error::RPCCallFailed),
+        }
+    }
+
+    pub async fn get_prefixes(&mut self) -> Result<Vec<String>, Error> {
+        self.connect().await?;
+        let response = self
+            .conn
+            .as_mut()
+            .unwrap()
+            .get_prefixes(Request::new(Empty {}))
+            .await;
+
+        match response {
+            Ok(resp) => Ok(resp.into_inner().prefixes),
+            Err(_) => Err(Error::RPCCallFailed),
+        }
+    }
+
+    pub async fn list_keys(&mut self, prefix: &str) -> Result<Vec<String>, Error> {
+        self.connect().await?;
+        let response = self
+            .conn
+            .as_mut()
+            .unwrap()
+            .list_keys(Request::new(ListKeysRequest {
+                prefix: String::from(prefix),
+            }))
+            .await;
+
+        match response {
+            Ok(resp) => Ok(resp.into_inner().keys),
             Err(_) => Err(Error::RPCCallFailed),
         }
     }

@@ -9,7 +9,10 @@ use skiff_proto::{
     skiff_client::SkiffClient, skiff_server::SkiffServer, DeleteReply, DeleteRequest, GetReply,
     GetRequest, InsertReply, InsertRequest,
 };
-use skiff_proto::{EntryReply, EntryRequest, ServerReply, ServerRequest, VoteReply, VoteRequest};
+use skiff_proto::{
+    Empty, EntryReply, EntryRequest, ListKeysReply, ListKeysRequest, PrefixReply, ServerReply,
+    ServerRequest, VoteReply, VoteRequest,
+};
 use std::cmp::min;
 use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
@@ -309,8 +312,7 @@ impl Skiff {
         commit_pair
     }
 
-    // Todo: add this to RPC server + client
-    pub async fn get_prefixes(&self) -> Result<Vec<String>, Error> {
+    async fn get_prefixes(&self) -> Result<Vec<String>, Error> {
         match self.state.lock().await.conn.get("trees")? {
             Some(tree_vec) => match bincode::deserialize::<Vec<String>>(&tree_vec) {
                 Ok(trees) => Ok(trees),
@@ -320,9 +322,51 @@ impl Skiff {
         }
     }
 
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, Error> {
+        let mut keys = vec![];
+        let trees = self.get_prefixes().await?;
+
+        // Todo: de-duplicate code
+        if prefix.is_empty() || prefix == "/" {
+            let tree = self.state.lock().await.conn.open_tree("base")?;
+
+            tree.into_iter()
+                .keys()
+                .map(|key| String::from_utf8(key.unwrap().to_vec()).unwrap())
+                .for_each(|key| {
+                    keys.push(key);
+                });
+        }
+
+        for tree_name in &trees {
+            let prefix_trimmed = match prefix.ends_with("/") {
+                true => prefix.trim_end_matches("/"),
+                false => prefix,
+            };
+
+            if tree_name.starts_with(prefix_trimmed) {
+                let tree = self
+                    .state
+                    .lock()
+                    .await
+                    .conn
+                    .open_tree(format!("base_{}", tree_name.replace("/", "_")))?;
+
+                tree.into_iter()
+                    .keys()
+                    .map(|key| String::from_utf8(key.unwrap().to_vec()).unwrap())
+                    .for_each(|key| {
+                        keys.push(format!("{}/{}", tree_name, key));
+                    });
+            }
+        }
+
+        Ok(keys)
+    }
+
     async fn get_logs(&self, peer: &Uuid) -> (u32, u32, Vec<skiff_proto::Log>) {
         let lock = self.state.lock().await;
-        let log_next_index = lock.next_index.get(peer).unwrap();
+        let log_next_index: &u32 = lock.next_index.get(peer).unwrap();
         let mut prev_log_index = 0;
         let mut prev_log_term = 0;
         let mut new_logs: Vec<skiff_proto::Log> = vec![];
@@ -383,9 +427,10 @@ impl Skiff {
 
         for (i, action) in new_logs {
             match action {
+                // Todo: handle and document difference between "key" and "/key"
                 Action::Insert(key, value) => {
                     let mut tree_parts: Vec<&str> = key.split("/").collect();
-                    tree_parts.pop();
+                    let key = tree_parts.pop().unwrap();
 
                     let mut tree_name = tree_parts.join("/");
                     tree_name = match tree_name.len() {
@@ -418,7 +463,7 @@ impl Skiff {
                 }
                 Action::Delete(key) => {
                     let mut tree_parts: Vec<&str> = key.split("/").collect();
-                    tree_parts.pop();
+                    let key = tree_parts.pop().unwrap();
 
                     let mut tree_name = tree_parts.join("/");
                     tree_name = match tree_name.len() {
@@ -508,6 +553,7 @@ impl Skiff {
                     return Err(Error::ClusterJoinFailed.into());
                 }
             }
+            // Todo: if we are lone node in cluster we can skip election timeout and make ourselves leader
 
             let mut server1 = skiff.clone();
             let _elections: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
@@ -918,7 +964,6 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
     }
 
     // Todo: maybe add watch_prefix function that communicates changes to clients
-    // Todo: maybe add something like get() with a prefix to get keys + trees under prefix
 
     // Todo: Forwarding to the leader fails when... there is no leader, or when we are a candiate
     // This is an issue when calling add_server from a follower to a server before the latter has elected itself
@@ -947,7 +992,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
 
         let get_request = request.into_inner();
         let mut tree_parts: Vec<&str> = get_request.key.split("/").collect();
-        tree_parts.pop();
+        let key = tree_parts.pop().unwrap();
 
         let mut tree_name = tree_parts.join("/");
         tree_name = match tree_name.len() {
@@ -956,7 +1001,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         };
 
         if let Ok(tree) = self.state.lock().await.conn.open_tree(tree_name) {
-            let value = tree.get(get_request.key);
+            let value = tree.get(key);
             match value {
                 Ok(inner1) => match inner1 {
                     Some(data) => Ok(Response::new(GetReply {
@@ -1031,5 +1076,54 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         let (_, notify) = &*commit_arc;
         notify.notified().await;
         Ok(Response::new(DeleteReply { success: true }))
+    }
+
+    async fn get_prefixes(&self, request: Request<Empty>) -> Result<Response<PrefixReply>, Status> {
+        // If follower, connect to leader and forward request
+        let election_state = self.state.lock().await.election_state.clone();
+        if let ElectionState::Follower(leader) = election_state {
+            let client = self
+                .get_peer_clients()
+                .await
+                .into_iter()
+                .find(|(id, _)| *id == leader)
+                .map(|(_, client)| client);
+            if let Some(client_inner) = client {
+                return client_inner.lock().await.get_prefixes(request).await;
+            }
+
+            return Err(Status::internal("failed to forward request to leader"));
+        }
+
+        match self.get_prefixes().await {
+            Ok(prefixes) => Ok(Response::new(PrefixReply { prefixes })),
+            Err(_) => Err(Status::internal("failed to get prefixes")),
+        }
+    }
+
+    async fn list_keys(
+        &self,
+        request: Request<ListKeysRequest>,
+    ) -> Result<Response<ListKeysReply>, Status> {
+        // If follower, connect to leader and forward request
+        let election_state = self.state.lock().await.election_state.clone();
+        if let ElectionState::Follower(leader) = election_state {
+            let client = self
+                .get_peer_clients()
+                .await
+                .into_iter()
+                .find(|(id, _)| *id == leader)
+                .map(|(_, client)| client);
+            if let Some(client_inner) = client {
+                return client_inner.lock().await.list_keys(request).await;
+            }
+
+            return Err(Status::internal("failed to forward request to leader"));
+        }
+
+        match self.list_keys(request.into_inner().prefix.as_str()).await {
+            Ok(keys) => Ok(Response::new(ListKeysReply { keys })),
+            Err(_) => Err(Status::internal("failed to get keys")),
+        }
     }
 }

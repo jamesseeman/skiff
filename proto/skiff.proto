@@ -2,10 +2,14 @@ syntax = "proto3";
 package skiff;
 
 service Skiff {
+  // client-server rpc's
   rpc Get(GetRequest) returns (GetReply);
   rpc Insert(InsertRequest) returns (InsertReply);
   rpc Delete(DeleteRequest) returns (DeleteReply);
+  rpc GetPrefixes(Empty) returns (PrefixReply);
+  rpc ListKeys(ListKeysRequest) returns (ListKeysReply);
 
+  // server-server rpc's
   rpc AppendEntry(EntryRequest) returns (EntryReply);
   rpc RequestVote(VoteRequest) returns (VoteReply);
   rpc AddServer(ServerRequest) returns (ServerReply);
@@ -85,4 +89,18 @@ message ServerRequest {
 message ServerReply {
   bool success = 1;
   optional bytes cluster = 2;
+}
+
+message Empty {}
+
+message PrefixReply {
+  repeated string prefixes = 1;
+}
+
+message ListKeysRequest {
+  string prefix = 1;
+}
+
+message ListKeysReply {
+  repeated string keys = 1;
 }

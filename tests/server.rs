@@ -192,22 +192,57 @@ async fn custom_struct() {
 
 #[tokio::test]
 #[serial]
-async fn test_prefixes() {
+async fn get_prefixes() {
     let leader = get_leader().unwrap();
     let leader_clone = leader.clone();
     let handle = tokio::spawn(async move {
         let _ = leader_clone.start().await;
     });
 
-    assert_eq!(Vec::<String>::new(), leader.get_prefixes().await.unwrap());
     let mut client = get_client().await.unwrap();
+    assert_eq!(Vec::<String>::new(), client.get_prefixes().await.unwrap());
     client.insert::<String>("parent/foo", "bar".into()).await;
-    assert_eq!(vec!["parent"], leader.get_prefixes().await.unwrap());
+    assert_eq!(vec!["parent"], client.get_prefixes().await.unwrap());
     client
         .insert::<String>("grandparent/parent/foo", "bar".into())
         .await;
     assert_eq!(
         vec!["parent", "grandparent/parent"],
-        leader.get_prefixes().await.unwrap()
+        client.get_prefixes().await.unwrap()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn list_prefixes() {
+    let leader = get_leader().unwrap();
+    let leader_clone = leader.clone();
+    let handle = tokio::spawn(async move {
+        let _ = leader_clone.start().await;
+    });
+
+    let mut client = get_client().await.unwrap();
+    assert_eq!(Vec::<String>::new(), client.list_keys("").await.unwrap());
+
+    client.insert::<String>("foo", "bar".into()).await;
+    client.insert::<String>("parent/foo", "bar".into()).await;
+    client
+        .insert::<String>("parent/child/foo", "bar".into())
+        .await;
+    client
+        .insert::<String>("grandparent/parent/foo", "bar".into())
+        .await;
+    assert_eq!(
+        vec![
+            "foo",
+            "parent/foo",
+            "parent/child/foo",
+            "grandparent/parent/foo"
+        ],
+        client.list_keys("").await.unwrap()
+    );
+    assert_eq!(
+        vec!["parent/foo", "parent/child/foo"],
+        client.list_keys("parent/").await.unwrap()
     );
 }
