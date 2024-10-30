@@ -122,6 +122,24 @@ async fn client_remove() {
 
 #[tokio::test]
 #[serial]
+async fn drop_tree() {
+    let leader = get_leader().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = leader.start().await;
+    });
+
+    let mut client = get_client().await.unwrap();
+    client
+        .insert::<String>("parent/foo", "bar".into())
+        .await
+        .unwrap();
+    assert_eq!(vec!["parent"], client.get_prefixes().await.unwrap());
+    client.remove("parent/foo").await.unwrap();
+    assert_eq!(Vec::<String>::new(), client.get_prefixes().await.unwrap());
+}
+
+#[tokio::test]
+#[serial]
 async fn two_node_cluster() {
     let leader = get_leader().unwrap();
     let leader_clone = leader.clone();

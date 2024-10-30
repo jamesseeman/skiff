@@ -133,9 +133,6 @@ impl Skiff {
 
     // todo: initializing a new cluster with a known config without needing to send add_server rpc
 
-    // todo: something like
-    // fn from_id(id: Uuid, data_dir) -> Result<Self, SkifError> {
-
     pub fn get_id(&self) -> Uuid {
         self.id
     }
@@ -465,17 +462,37 @@ impl Skiff {
                     let mut tree_parts: Vec<&str> = key.split("/").collect();
                     let key = tree_parts.pop().unwrap();
 
-                    let mut tree_name = tree_parts.join("/");
-                    tree_name = match tree_name.len() {
+                    let prefix = tree_parts.join("/");
+                    let tree_name = match prefix.len() {
                         0 => "base".to_string(),
-                        _ => format!("base_{}", tree_name.replace("/", "_")),
+                        _ => format!("base_{}", &prefix.replace("/", "_")),
                     };
 
-                    // Todo: delete tree if it's now empty
                     let trees = self.state.lock().await.conn.tree_names();
                     if trees.contains(&tree_name.as_bytes().into()) {
-                        let tree = self.state.lock().await.conn.open_tree(tree_name)?;
+                        let lock = self.state.lock().await;
+                        let tree = lock.conn.open_tree(&tree_name)?;
                         tree.remove(key)?;
+
+                        if tree.is_empty() {
+                            let _ = lock.conn.drop_tree(&tree_name);
+                            lock.conn.update_and_fetch("trees", |trees| match trees {
+                                Some(tree_vec) => {
+                                    let mut updated_tree_vec =
+                                        bincode::deserialize::<Vec<String>>(tree_vec).unwrap();
+
+                                    println!("{:?}, {}", updated_tree_vec, tree_name);
+                                    if let Some(index) =
+                                        updated_tree_vec.iter().position(|name| name == &prefix)
+                                    {
+                                        updated_tree_vec.remove(index);
+                                    }
+
+                                    Some(bincode::serialize(&updated_tree_vec).unwrap())
+                                }
+                                None => Some(bincode::serialize(&Vec::<String>::new()).unwrap()),
+                            });
+                        }
                     }
                 }
                 Action::Configure(config) => {
@@ -582,7 +599,6 @@ impl Skiff {
         Ok(())
     }
 
-    // todo: rename or break up, as it's handling leader logic as well as elections
     async fn election_manager(&mut self) -> Result<(), anyhow::Error> {
         let mut rng = {
             let rng = rand::thread_rng();

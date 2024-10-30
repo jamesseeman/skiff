@@ -4,7 +4,6 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Builder {
-    id: Uuid,
     bind_address: Ipv4Addr,
     data_dir: String,
 
@@ -22,15 +21,10 @@ impl Default for Builder {
 impl Builder {
     pub fn new() -> Self {
         Self {
-            id: Uuid::new_v4(),
             bind_address: Ipv4Addr::new(127, 0, 0, 1),
             data_dir: "/tmp/skiff".to_string(),
             peers: vec![],
         }
-    }
-
-    pub fn id(&self) -> Uuid {
-        self.id
     }
 
     pub fn set_dir(mut self, dir: &str) -> Self {
@@ -48,13 +42,8 @@ impl Builder {
         self
     }
 
-    pub fn from_config(id: u32, dir: Option<&str>) -> Self {
-        let data_dir = dir.unwrap_or("/tmp/skiff");
-
-        todo!()
-    }
-
+    // todo: load id, snapshots, etc from data_dir if present
     pub fn build(self) -> Result<Skiff, Error> {
-        Skiff::new(self.id, self.bind_address, self.data_dir, self.peers)
+        Skiff::new(Uuid::new_v4(), self.bind_address, self.data_dir, self.peers)
     }
 }
