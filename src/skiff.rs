@@ -11,15 +11,19 @@ use skiff_proto::{
 };
 use skiff_proto::{
     Empty, EntryReply, EntryRequest, ListKeysReply, ListKeysRequest, PrefixReply, ServerReply,
-    ServerRequest, VoteReply, VoteRequest,
+    ServerRequest, SubscribeReply, SubscribeRequest, VoteReply, VoteRequest,
 };
 use std::cmp::min;
+use std::pin::Pin;
 use std::time::Duration;
 use std::{collections::HashMap, str::FromStr};
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
 };
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
+
 use tokio::sync::{mpsc, Mutex, Notify};
 use tonic::{transport::Channel, Request, Response, Status};
 use uuid::Uuid;
@@ -70,6 +74,7 @@ pub struct Skiff {
     state: Arc<Mutex<State>>,
     tx_entries: Arc<Mutex<mpsc::Sender<u8>>>,
     rx_entries: Arc<Mutex<mpsc::Receiver<u8>>>,
+    subscribers: Arc<Mutex<HashMap<String, Vec<mpsc::Sender<SubscribeReply>>>>>,
 }
 
 // Todo: env logging
@@ -128,6 +133,7 @@ impl Skiff {
             })),
             tx_entries: Arc::new(Mutex::new(tx_entries)),
             rx_entries: Arc::new(Mutex::new(rx_entries)),
+            subscribers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -426,11 +432,12 @@ impl Skiff {
             match action {
                 // Todo: handle and document difference between "key" and "/key"
                 Action::Insert(key, value) => {
+                    let full_key = key.clone();
                     let mut tree_parts: Vec<&str> = key.split("/").collect();
                     let key = tree_parts.pop().unwrap();
 
-                    let mut tree_name = tree_parts.join("/");
-                    tree_name = match tree_name.len() {
+                    let prefix = tree_parts.join("/");
+                    let tree_name = match prefix.len() {
                         0 => "base".to_string(),
                         _ => {
                             self.state
@@ -442,18 +449,46 @@ impl Skiff {
                                         let mut updated_tree_vec =
                                             bincode::deserialize::<Vec<String>>(tree_vec).unwrap();
 
-                                        if !updated_tree_vec.contains(&tree_name) {
-                                            updated_tree_vec.push(tree_name.clone());
+                                        if !updated_tree_vec.contains(&prefix) {
+                                            updated_tree_vec.push(prefix.clone());
                                         }
 
                                         Some(bincode::serialize(&updated_tree_vec).unwrap())
                                     }
-                                    None => Some(bincode::serialize(&vec![&tree_name]).unwrap()),
+                                    None => Some(bincode::serialize(&vec![&prefix]).unwrap()),
                                 });
 
-                            format!("base_{}", tree_name.replace("/", "_"))
+                            format!("base_{}", &prefix.replace("/", "_"))
                         }
                     };
+
+                    // Todo: maybe alert subscribers on delete
+                    let mut subscribers = self.subscribers.lock().await;
+                    for (sub_prefix, senders) in subscribers.iter_mut() {
+                        // Todo: this could cause issues when the provided prefix is parent/ and tree is ex. parents/ or parent1/, etc
+                        if prefix.starts_with(sub_prefix.trim_end_matches("/")) {
+                            let mut drop_senders = Vec::new();
+                            for (i, sender) in senders.iter_mut().enumerate() {
+                                // Todo: delete the sender if this receives an error
+                                match sender
+                                    .send(SubscribeReply {
+                                        key: full_key.clone(),
+                                        action: skiff_proto::Action::Insert as i32,
+                                        value: Some(value.clone()),
+                                    })
+                                    .await
+                                {
+                                    Ok(_) => continue,
+                                    Err(_) => {
+                                        drop_senders.push(i);
+                                    }
+                                }
+                            }
+                            for i in drop_senders {
+                                senders.remove(i);
+                            }
+                        }
+                    }
 
                     let tree = self.state.lock().await.conn.open_tree(tree_name)?;
                     tree.insert(key, value)?;
@@ -778,6 +813,8 @@ impl Skiff {
 // todo: access control. checking if id matches leaderid, if request comes from within cluster, etc
 #[tonic::async_trait]
 impl skiff_proto::skiff_server::Skiff for Skiff {
+    type SubscribeStream = Pin<Box<dyn Stream<Item = Result<SubscribeReply, Status>> + Send>>;
+
     async fn request_vote(
         &self,
         request: Request<VoteRequest>,
@@ -1141,5 +1178,26 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
             Ok(keys) => Ok(Response::new(ListKeysReply { keys })),
             Err(_) => Err(Status::internal("failed to get keys")),
         }
+    }
+
+    // This shouldn't need forwarding to leader
+    async fn subscribe(
+        &self,
+        request: Request<SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let prefix = request.into_inner().prefix;
+
+        let (sender, receiver) = mpsc::channel(32);
+        let mut subscribers = self.subscribers.lock().await;
+        if !subscribers.contains_key(&prefix) {
+            subscribers.insert(prefix.clone(), Vec::new());
+        }
+
+        let senders = subscribers.get_mut(&prefix).unwrap();
+        senders.push(sender);
+
+        let stream = ReceiverStream::new(receiver).map(Ok);
+
+        Ok(Response::new(Box::pin(stream)))
     }
 }

@@ -8,6 +8,7 @@ service Skiff {
   rpc Delete(DeleteRequest) returns (DeleteReply);
   rpc GetPrefixes(Empty) returns (PrefixReply);
   rpc ListKeys(ListKeysRequest) returns (ListKeysReply);
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeReply);
 
   // server-server rpc's
   rpc AppendEntry(EntryRequest) returns (EntryReply);
@@ -103,4 +104,14 @@ message ListKeysRequest {
 
 message ListKeysReply {
   repeated string keys = 1;
+}
+
+message SubscribeRequest {
+  string prefix = 1;
+}
+
+message SubscribeReply {
+  string key = 1;
+  Action action = 2;
+  optional bytes value = 3;
 }

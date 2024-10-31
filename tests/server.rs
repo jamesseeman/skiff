@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serial_test::serial;
 use skiff::Client;
 use skiff::Skiff;
+use skiff::Subscriber;
 
 fn get_leader() -> Result<Skiff, anyhow::Error> {
     let dir = String::from("target/tmp/test/127.0.0.1");
@@ -262,5 +263,41 @@ async fn list_prefixes() {
     assert_eq!(
         vec!["parent/foo", "parent/child/foo"],
         client.list_keys("parent/").await.unwrap()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn watch_prefix() {
+    let leader = get_leader().unwrap();
+    let leader_clone = leader.clone();
+    let handle = tokio::spawn(async move {
+        let _ = leader_clone.start().await;
+    });
+
+    let mut client1 = get_client().await.unwrap();
+    let mut client2: Client = get_client().await.unwrap();
+
+    tokio::spawn(async move {
+        client1.insert::<String>("foo", "bar".into()).await;
+        client1.insert::<String>("parent/foo", "bar".into()).await;
+        client1
+            .insert::<String>("parent/child/foo", "bar".into())
+            .await;
+        client1
+            .insert::<String>("grandparent/parent/foo", "bar".into())
+            .await;
+    });
+
+    let mut subscriber: Subscriber = client2.watch("parent/").await.unwrap();
+    let mut recvd = Vec::new();
+    for _ in 0..2 {
+        let (key, _) = subscriber.recv::<String>().await.unwrap();
+        recvd.push(key);
+    }
+
+    assert_eq!(
+        vec!["parent/foo".to_string(), "parent/child/foo".to_string()],
+        recvd
     );
 }

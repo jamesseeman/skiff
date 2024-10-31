@@ -7,6 +7,7 @@ keyboards = ["raft", "sled"]
 
 
 [dependencies]
+tokio-stream = "0.1.16"
 tokio = { version = "1.39.2", features = ["full"] }
 anyhow = "1.0.86"
 thiserror = "1.0"

@@ -6,8 +6,10 @@ use tonic::{transport::Channel, Request};
 use crate::{
     error::Error,
     skiff::skiff_proto::{
-        skiff_client::SkiffClient, DeleteRequest, Empty, GetRequest, InsertRequest, ListKeysRequest,
+        skiff_client::SkiffClient, DeleteRequest, Empty, GetRequest, InsertRequest,
+        ListKeysRequest, SubscribeRequest,
     },
+    Subscriber,
 };
 
 #[derive(Debug)]
@@ -134,6 +136,23 @@ impl Client {
 
         match response {
             Ok(resp) => Ok(resp.into_inner().keys),
+            Err(_) => Err(Error::RPCCallFailed),
+        }
+    }
+
+    pub async fn watch(&mut self, prefix: &str) -> Result<Subscriber, Error> {
+        self.connect().await?;
+        let response = self
+            .conn
+            .as_mut()
+            .unwrap()
+            .subscribe(Request::new(SubscribeRequest {
+                prefix: String::from(prefix),
+            }))
+            .await;
+
+        match response {
+            Ok(resp) => Ok(Subscriber::new(resp.into_inner())),
             Err(_) => Err(Error::RPCCallFailed),
         }
     }
