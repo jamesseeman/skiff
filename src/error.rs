@@ -27,6 +27,10 @@ pub enum Error {
     InsertFailed,
     #[error("Missing cluster configuration")]
     MissingClusterConfig,
+    #[error("Peer not found")]
+    PeerNotFound,
+    #[error("Failed to connect to peer")]
+    PeerConnectFailed,
 }
 
 impl From<tonic::transport::Error> for Error {

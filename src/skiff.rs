@@ -32,7 +32,7 @@ use uuid::Uuid;
 enum Action {
     Insert(String, Vec<u8>),
     Delete(String),
-    Configure(Vec<(Uuid, Ipv4Addr)>),
+    Configure(HashMap<Uuid, Ipv4Addr>),
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +84,7 @@ pub struct Skiff {
 // - threshold for automatically snapshotting
 // and add corresponding functionality
 // Todo: allow custom port, swap out Ipv4Addr w SocketAddr where appropriate
+// Todo: separate address into bind_addr and advertise_addr
 // Todo: docs
 // Todo: publish to crates.io
 impl Skiff {
@@ -100,10 +101,12 @@ impl Skiff {
         // We don't know the actual uuids, we will retrieve them once the server starts
         // For now, intialize with nil Uuids
         // Finally add this node to the cluster
-        let mut cluster: Vec<(Uuid, Ipv4Addr)> =
-            peers.into_iter().map(|addr| (Uuid::nil(), addr)).collect();
+        let mut cluster: HashMap<Uuid, Ipv4Addr> = peers
+            .into_iter()
+            .map(|addr| (Uuid::new_v4(), addr))
+            .collect();
 
-        cluster.push((id, address));
+        cluster.insert(id, address);
 
         // Initialize the log with the cluster
         // Todo: need to consider how this will work once snapshots are implemented, as we'll need
@@ -167,7 +170,7 @@ impl Skiff {
 
     // Todo: consider if this should return result, although there should always be a cluster_config log
     // handle missing cluster configuration? sole node in cluster?
-    pub async fn get_cluster(&self) -> Result<Vec<(Uuid, Ipv4Addr)>, Error> {
+    pub async fn get_cluster(&self) -> Result<HashMap<Uuid, Ipv4Addr>, Error> {
         let config = match self
             .state
             .lock()
@@ -187,56 +190,48 @@ impl Skiff {
         Ok(config)
     }
 
-    async fn get_peers(&self) -> Vec<(Uuid, Ipv4Addr)> {
+    async fn get_peers(&self) -> HashMap<Uuid, Ipv4Addr> {
         self.get_cluster()
             .await
             // Todo: figure out if unwrap is sufficient or if this needs to return Result
-            // affects get_peer_clients()
+            // affects get_peer_client()
             .unwrap()
             .into_iter()
             .filter(|(_, addr)| *addr != self.address)
             .collect()
     }
 
-    async fn get_peer_clients(&self) -> Vec<(Uuid, Arc<Mutex<SkiffClient<Channel>>>)> {
+    async fn get_peer_client(
+        &self,
+        peer: &Uuid,
+    ) -> Result<Arc<Mutex<SkiffClient<Channel>>>, Error> {
         let peers = self.get_peers().await;
 
-        let lock = self.state.lock().await;
-        let mut retry = vec![];
-        let mut peer_clients: Vec<(Uuid, Arc<Mutex<SkiffClient<Channel>>>)> = peers
-            .into_iter()
-            .filter_map(
-                |(peer_id, peer_addr)| match lock.peer_clients.get(&peer_id) {
-                    Some(client) => Some((peer_id, client.clone())),
-                    None => {
-                        retry.push((peer_id, peer_addr));
-                        None
-                    }
-                },
-            )
-            .collect();
-
-        // todo: bit sloppy, try to fix
-        drop(lock);
-        let mut lock = self.state.lock().await;
-
-        // Todo: maybe after n failed connection attempts, remove server from cluster
-        for (peer_id, peer_addr) in retry {
-            match SkiffClient::connect(format!("http://{}", SocketAddrV4::new(peer_addr, 9400)))
-                .await
-            {
-                Ok(client) => {
-                    let arc = Arc::new(Mutex::new(client));
-                    lock.peer_clients.insert(peer_id, arc.clone());
-                    peer_clients.push((peer_id, arc));
-                }
-                Err(_) => {
-                    println!("Failed to connect");
-                }
-            }
+        if !peers.contains_key(peer) {
+            return Err(Error::PeerNotFound);
         }
 
-        peer_clients
+        if let Some(client) = self.state.lock().await.peer_clients.get(peer) {
+            return Ok(client.clone());
+        }
+
+        match SkiffClient::connect(format!(
+            "http://{}",
+            SocketAddrV4::new(*peers.get(peer).unwrap(), 9400)
+        ))
+        .await
+        {
+            Ok(client) => {
+                let arc = Arc::new(Mutex::new(client));
+                self.state
+                    .lock()
+                    .await
+                    .peer_clients
+                    .insert(peer.to_owned(), arc.clone());
+                Ok(arc)
+            }
+            Err(_) => Err(Error::PeerConnectFailed),
+        }
     }
 
     async fn drop_peer_client(&self, id: &Uuid) {
@@ -568,7 +563,7 @@ impl Skiff {
                 println!("Joining cluster");
 
                 let mut joined_cluster = false;
-                for (id, client) in skiff.get_peer_clients().await {
+                for id in skiff.get_peers().await.keys() {
                     println!("Asking {:?} to join cluster", id);
 
                     let mut request = Request::new(ServerRequest {
@@ -578,7 +573,9 @@ impl Skiff {
 
                     request.set_timeout(Duration::from_millis(300));
 
-                    match client.lock().await.add_server(request).await {
+                    let client_arc = skiff.get_peer_client(id).await.unwrap();
+                    let mut client = client_arc.lock().await;
+                    match client.add_server(request).await {
                         Ok(response) => {
                             let inner = response.into_inner();
                             if inner.success {
@@ -657,8 +654,8 @@ impl Skiff {
                         let last_log_index = self.get_last_log_index().await;
                         let committed_index = self.get_commit_index().await;
                         let current_term = self.get_current_term().await;
-                        for (peer, client) in self.get_peer_clients().await.into_iter() {
-                            let (peer_last_log_index, peer_last_log_term, entries) = self.get_logs(&peer).await;
+                        for peer in self.get_peers().await.keys() {
+                            let (peer_last_log_index, peer_last_log_term, entries) = self.get_logs(peer).await;
                             let num_entries = entries.len();
                             let mut request = Request::new(EntryRequest {
                                 term: current_term,
@@ -672,29 +669,31 @@ impl Skiff {
                             request.set_timeout(Duration::from_millis(300));
 
                             // todo: if response term > current_term, switch to follower, same for request_vote
-                            match client.lock().await.append_entry(request).await {
+                            let client_arc = self.get_peer_client(peer).await.unwrap();
+                            let mut client = client_arc.lock().await;
+                            match client.append_entry(request).await {
                                 Ok(response) => {
                                     match response.into_inner().success {
                                         true => {
                                             if num_entries > 0 {
-                                                if let Some(value) = self.state.lock().await.next_index.get_mut(&peer) {
+                                                if let Some(value) = self.state.lock().await.next_index.get_mut(peer) {
                                                     *value = last_log_index + 1;
                                                 }
 
-                                                if let Some(value) = self.state.lock().await.match_index.get_mut(&peer) {
+                                                if let Some(value) = self.state.lock().await.match_index.get_mut(peer) {
                                                     *value = last_log_index;
                                                 }
                                             }
                                         },
                                         false => {
                                             // Decrement next_index for peer
-                                            if let Some(value) = self.state.lock().await.next_index.get_mut(&peer) {
+                                            if let Some(value) = self.state.lock().await.next_index.get_mut(peer) {
                                                 *value -= 1;
                                             }
                                         }
                                     }
                                 },
-                                Err(_) => { self.drop_peer_client(&peer).await; }
+                                Err(_) => { self.drop_peer_client(peer).await; }
                             }
                         }
 
@@ -740,7 +739,7 @@ impl Skiff {
 
         let mut num_votes: u32 = 1; // including self
 
-        for (peer, client) in self.get_peer_clients().await.into_iter() {
+        for peer in self.get_peers().await.keys() {
             println!("sending to client: {:?}", peer);
 
             let mut request = Request::new(VoteRequest {
@@ -751,10 +750,11 @@ impl Skiff {
             });
             request.set_timeout(Duration::from_millis(300));
 
+            let client = self.get_peer_client(peer).await.unwrap();
             let response = match client.lock().await.request_vote(request).await {
                 Ok(response) => response.into_inner(),
                 Err(_) => {
-                    self.drop_peer_client(&peer).await;
+                    self.drop_peer_client(peer).await;
                     continue;
                 }
             };
@@ -779,17 +779,17 @@ impl Skiff {
                 let peers = self.get_peers().await;
                 let mut lock = self.state.lock().await;
                 lock.next_index = peers
-                    .iter()
-                    .map(|(peer_id, _)| (*peer_id, last_log_index + 1))
+                    .keys()
+                    .map(|peer_id| (*peer_id, last_log_index + 1))
                     .collect::<HashMap<Uuid, u32>>();
                 lock.match_index = peers
-                    .into_iter()
-                    .map(|(peer_id, _)| (peer_id, 0))
+                    .into_keys()
+                    .map(|peer_id| (peer_id, 0))
                     .collect::<HashMap<Uuid, u32>>();
             }
 
             // Send empty heartbeat
-            for (peer, client) in self.get_peer_clients().await.into_iter() {
+            for id in self.get_peers().await.keys() {
                 let mut request = Request::new(EntryRequest {
                     term: current_term,
                     leader_id: self.id.to_string(),
@@ -800,8 +800,10 @@ impl Skiff {
                 });
                 request.set_timeout(Duration::from_millis(300));
 
-                if let Err(_) = client.lock().await.append_entry(request).await {
-                    self.drop_peer_client(&peer).await;
+                let client_arc = self.get_peer_client(id).await.unwrap();
+                let mut client = client_arc.lock().await;
+                if let Err(_) = client.append_entry(request).await {
+                    self.drop_peer_client(id).await;
                 }
             }
         }
@@ -965,13 +967,8 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
     ) -> Result<Response<ServerReply>, Status> {
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
-            let client = self
-                .get_peer_clients()
-                .await
-                .into_iter()
-                .find(|(id, _)| *id == leader)
-                .map(|(_, client)| client);
-            if let Some(client_inner) = client {
+            let client = self.get_peer_client(&leader).await;
+            if let Ok(client_inner) = client {
                 return client_inner.lock().await.add_server(request).await;
             }
 
@@ -982,15 +979,13 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         let new_server = request.into_inner();
         let new_uuid = Uuid::from_str(&new_server.id).unwrap();
 
-        let mut cluster_config: Vec<(Uuid, Ipv4Addr)> = self.get_cluster().await.unwrap();
+        let mut cluster_config: HashMap<Uuid, Ipv4Addr> = self.get_cluster().await.unwrap();
 
-        let server_entry = (
-            Uuid::from_str(&new_server.id).unwrap(),
-            Ipv4Addr::from_str(&new_server.address).unwrap(),
-        );
+        let id = Uuid::from_str(&new_server.id).unwrap();
+        let addr = Ipv4Addr::from_str(&new_server.address).unwrap();
 
-        if !cluster_config.contains(&server_entry) {
-            cluster_config.push(server_entry);
+        if cluster_config.get(&id).is_none() {
+            cluster_config.insert(id, addr);
             self.log(Action::Configure(cluster_config.clone())).await;
         }
 
@@ -1030,13 +1025,8 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         // resulting in an outdated get. The current workaround is to just forward the request.
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
-            let client = self
-                .get_peer_clients()
-                .await
-                .into_iter()
-                .find(|(id, _)| *id == leader)
-                .map(|(_, client)| client);
-            if let Some(client_inner) = client {
+            let client = self.get_peer_client(&leader).await;
+            if let Ok(client_inner) = client {
                 return client_inner.lock().await.get(request).await;
             }
 
@@ -1076,13 +1066,8 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         // If follower, connect to leader and forward request
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
-            let client = self
-                .get_peer_clients()
-                .await
-                .into_iter()
-                .find(|(id, _)| *id == leader)
-                .map(|(_, client)| client);
-            if let Some(client_inner) = client {
+            let client = self.get_peer_client(&leader).await;
+            if let Ok(client_inner) = client {
                 return client_inner.lock().await.insert(request).await;
             }
 
@@ -1108,13 +1093,8 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         // If follower, connect to leader and forward request
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
-            let client = self
-                .get_peer_clients()
-                .await
-                .into_iter()
-                .find(|(id, _)| *id == leader)
-                .map(|(_, client)| client);
-            if let Some(client_inner) = client {
+            let client = self.get_peer_client(&leader).await;
+            if let Ok(client_inner) = client {
                 return client_inner.lock().await.delete(request).await;
             }
 
@@ -1135,13 +1115,8 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         // If follower, connect to leader and forward request
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
-            let client = self
-                .get_peer_clients()
-                .await
-                .into_iter()
-                .find(|(id, _)| *id == leader)
-                .map(|(_, client)| client);
-            if let Some(client_inner) = client {
+            let client = self.get_peer_client(&leader).await;
+            if let Ok(client_inner) = client {
                 return client_inner.lock().await.get_prefixes(request).await;
             }
 
@@ -1161,13 +1136,8 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         // If follower, connect to leader and forward request
         let election_state = self.state.lock().await.election_state.clone();
         if let ElectionState::Follower(leader) = election_state {
-            let client = self
-                .get_peer_clients()
-                .await
-                .into_iter()
-                .find(|(id, _)| *id == leader)
-                .map(|(_, client)| client);
-            if let Some(client_inner) = client {
+            let client = self.get_peer_client(&leader).await;
+            if let Ok(client_inner) = client {
                 return client_inner.lock().await.list_keys(request).await;
             }
 
