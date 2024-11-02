@@ -44,7 +44,7 @@ struct Log {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-enum ElectionState {
+pub enum ElectionState {
     Candidate,
     Leader,
     Follower(Uuid),
@@ -240,7 +240,7 @@ impl Skiff {
     }
 
     // todo: consider making these macros
-    async fn get_election_state(&self) -> ElectionState {
+    pub async fn get_election_state(&self) -> ElectionState {
         self.state.lock().await.election_state.clone()
     }
 
