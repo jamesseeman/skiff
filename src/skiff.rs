@@ -24,7 +24,7 @@ use std::{
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tonic::{transport::Channel, Request, Response, Status};
 use uuid::Uuid;
 
@@ -177,6 +177,8 @@ pub struct Skiff {
     tx_entries: Arc<Mutex<mpsc::Sender<u8>>>,
     rx_entries: Arc<Mutex<mpsc::Receiver<u8>>>,
     subscribers: Arc<Mutex<HashMap<String, Vec<mpsc::Sender<SubscribeReply>>>>>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl Skiff {
@@ -189,6 +191,7 @@ impl Skiff {
         let conn = sled::open(data_dir)?;
         let id = load_or_create_id(&conn)?;
         let (tx_entries, rx_entries) = mpsc::channel(32);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let (current_term, voted_for, persisted_log, last_applied) = load_raft_state(&conn)?;
 
@@ -230,6 +233,8 @@ impl Skiff {
             tx_entries: Arc::new(Mutex::new(tx_entries)),
             rx_entries: Arc::new(Mutex::new(rx_entries)),
             subscribers: Arc::new(Mutex::new(HashMap::new())),
+            shutdown_tx: Arc::new(shutdown_tx),
+            shutdown_rx,
         })
     }
 
@@ -237,6 +242,12 @@ impl Skiff {
 
     pub fn get_id(&self) -> Uuid {
         self.id
+    }
+
+    /// Signal the node to stop its background tasks (election manager).
+    /// Call this before dropping the node to ensure sled is cleanly released.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 
     pub fn get_address(&self) -> Ipv4Addr {
@@ -710,11 +721,15 @@ impl Skiff {
     // Todo: snapshot / log compaction, resuming operation after restart
     pub async fn start(self) -> Result<(), anyhow::Error> {
         let service = self.initialize_service();
+        let mut shutdown = self.shutdown_rx.clone();
 
         let bind_address = SocketAddr::new(self.address.into(), self.port);
         tonic::transport::Server::builder()
             .add_service(service)
-            .serve(bind_address)
+            .serve_with_shutdown(bind_address, async move {
+                // Wait for shutdown signal, then let tonic close all connections cleanly.
+                let _ = shutdown.changed().await;
+            })
             .await?;
 
         Ok(())
@@ -727,6 +742,7 @@ impl Skiff {
         };
 
         let mut rx_entries = self.rx_entries.lock().await;
+        let mut shutdown = self.shutdown_rx.clone();
 
         #[allow(unreachable_code)]
         loop {
@@ -796,12 +812,13 @@ impl Skiff {
                             let num_peers_applied = self.state.lock().await.match_index.iter().filter(|(_, &applied_index)| applied_index >= i).collect::<Vec<_>>().len() + 1;
                             // Make sure that i is in this term
                             let correct_term = self.state.lock().await.log.iter().filter(|log| log.index == i && log.term != current_term).collect::<Vec<_>>().is_empty();
-                            if (num_peers_applied > num_peers / 2) && correct_term {
+                                if (num_peers_applied > num_peers / 2) && correct_term {
                                 self.state.lock().await.committed_index = i;
                                 break
                             }
                         }
                     }
+                    _ = shutdown.changed() => { return Ok(()); }
                 }
             } else {
                 tokio::select! {
@@ -814,6 +831,8 @@ impl Skiff {
                         println!("Timeout: starting election");
                         self.run_election().await?;
                     }
+
+                    _ = shutdown.changed() => { return Ok(()); }
                 };
             }
         }
@@ -1137,11 +1156,46 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
 
     async fn remove_server(
         &self,
-        _request: Request<ServerRequest>,
+        request: Request<ServerRequest>,
     ) -> Result<Response<ServerReply>, Status> {
-        Err(Status::unimplemented(
-            "remove_server is not yet implemented",
-        ))
+        let election_state = self.state.lock().await.election_state.clone();
+        if let ElectionState::Follower(leader) = election_state {
+            let client = self.get_peer_client(&leader).await;
+            if let Ok(client_inner) = client {
+                return client_inner.lock().await.remove_server(request).await;
+            }
+            return Err(Status::internal("failed to forward request to leader"));
+        }
+
+        let remove_request = request.into_inner();
+        let remove_id = Uuid::from_str(&remove_request.id)
+            .map_err(|_| Status::invalid_argument("invalid server id"))?;
+
+        let mut cluster_config = self
+            .get_cluster()
+            .await
+            .map_err(|_| Status::internal("failed to get cluster config"))?;
+
+        if cluster_config.remove(&remove_id).is_none() {
+            return Err(Status::not_found("server not found in cluster"));
+        }
+
+        self.log(Action::Configure(cluster_config.clone())).await;
+
+        {
+            let mut state = self.state.lock().await;
+            state.next_index.remove(&remove_id);
+            state.match_index.remove(&remove_id);
+        }
+        self.drop_peer_client(&remove_id).await;
+
+        Ok(Response::new(ServerReply {
+            success: true,
+            cluster: Some(
+                bincode::serialize(&cluster_config)
+                    .map_err(|_| Status::internal("failed to serialize cluster"))?,
+            ),
+        }))
     }
 
     // Todo: maybe add watch_prefix function that communicates changes to clients

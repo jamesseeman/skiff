@@ -2,12 +2,13 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use serde::{de::DeserializeOwned, Serialize};
 use tonic::{transport::Channel, Request};
+use uuid::Uuid;
 
 use crate::{
     error::Error,
     skiff::skiff_proto::{
         skiff_client::SkiffClient, DeleteRequest, Empty, GetRequest, InsertRequest,
-        ListKeysRequest, SubscribeRequest,
+        ListKeysRequest, ServerRequest, SubscribeRequest,
     },
     Subscriber,
 };
@@ -145,6 +146,27 @@ impl Client {
 
         match response {
             Ok(resp) => Ok(resp.into_inner().keys),
+            Err(_) => Err(Error::RPCCallFailed),
+        }
+    }
+
+    pub async fn remove_node(&mut self, id: Uuid, address: Ipv4Addr) -> Result<(), Error> {
+        self.connect().await?;
+        let response = self
+            .conn
+            .as_mut()
+            .unwrap()
+            .remove_server(Request::new(ServerRequest {
+                id: id.to_string(),
+                address: address.to_string(),
+            }))
+            .await;
+
+        match response {
+            Ok(resp) => match resp.into_inner().success {
+                true => Ok(()),
+                false => Err(Error::RPCCallFailed),
+            },
             Err(_) => Err(Error::RPCCallFailed),
         }
     }
