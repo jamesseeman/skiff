@@ -6,9 +6,18 @@ authors = ["James Seeman"]
 description = "An embedded Raft consensus library backed by sled"
 license = "MIT"
 repository = "https://github.com/jamesseeman/skiff"
+readme = "README.md"
 keywords = ["raft", "consensus", "distributed", "sled", "kv"]
 categories = ["database-implementations", "network-programming"]
 
+# docs.rs doesn't have protoc installed; enable the docs-rs feature to
+# compile protoc from source via protobuf-src when building there.
+[features]
+docs-rs = ["dep:protobuf-src"]
+
+[package.metadata.docs.rs]
+features = ["docs-rs"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 tokio-stream = "0.1.16"
@@ -25,6 +34,7 @@ tracing = "0.1"
 
 [build-dependencies]
 tonic-build = "0.12"
+protobuf-src = { version = "1", optional = true }
 
 [dev-dependencies]
 serial_test = "3.1.1"
