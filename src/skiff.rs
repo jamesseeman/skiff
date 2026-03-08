@@ -720,6 +720,7 @@ impl Skiff {
 
         let conn = self.state.lock().await.conn.clone();
         persist_last_applied(&conn, committed_index)?;
+        conn.flush_async().await.map_err(Error::SledError)?;
         self.state.lock().await.last_applied = committed_index;
 
         Ok(())
