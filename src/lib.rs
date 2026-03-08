@@ -32,10 +32,11 @@
 //!         .bind("127.0.0.1".parse()?)
 //!         .build()?;
 //!
-//!     tokio::spawn(async move { node.start().await });
+//!     let node_ref = node.clone();
+//!     tokio::spawn(async move { node_ref.start().await });
 //!
-//!     // Give the node time to elect a leader.
-//!     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+//!     // Block until a leader is elected before connecting a client.
+//!     node.wait_for_leader(std::time::Duration::from_secs(2)).await?;
 //!
 //!     // Connect a client and perform some operations.
 //!     let mut client = Client::new(vec!["127.0.0.1".parse()?]);

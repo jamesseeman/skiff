@@ -296,6 +296,51 @@ impl Skiff {
         }
     }
 
+    /// Block until the cluster has an elected leader, or until `timeout` elapses.
+    ///
+    /// Polls [`is_leader_elected`](Skiff::is_leader_elected) every 50 ms.
+    /// Call this after spawning [`start`](Skiff::start) to ensure the cluster
+    /// is ready before connecting a client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::LeaderElectionTimeout`] if no leader is elected within
+    /// `timeout`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use skiff_rs::Builder;
+    /// use std::time::Duration;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let node = Builder::new()
+    ///     .set_dir("/tmp/my-node")
+    ///     .bind("127.0.0.1".parse()?)
+    ///     .build()?;
+    ///
+    /// let node_ref = node.clone();
+    /// tokio::spawn(async move { node_ref.start().await });
+    ///
+    /// // Block until a leader is elected before connecting a client.
+    /// node.wait_for_leader(Duration::from_secs(2)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn wait_for_leader(&self, timeout: Duration) -> Result<(), Error> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if self.is_leader_elected().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| Error::LeaderElectionTimeout)
+    }
+
     /// Return the current cluster membership as a map of node ID → address.
     ///
     /// The membership is derived from the most recent `Configure` entry in the

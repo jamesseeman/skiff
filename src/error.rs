@@ -63,6 +63,10 @@ pub enum Error {
     /// The subscription stream was closed by the server.
     #[error("Subscriber stream closed")]
     StreamClosed,
+
+    /// No leader was elected within the requested timeout.
+    #[error("Timed out waiting for leader election")]
+    LeaderElectionTimeout,
 }
 
 impl From<tonic::transport::Error> for Error {

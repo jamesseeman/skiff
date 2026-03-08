@@ -57,19 +57,11 @@ fn get_follower(address: &str) -> Result<Skiff, Box<dyn std::error::Error>> {
         .build()?)
 }
 
-// Todo: there's still some race conditions here, for some reason if from_millis is too low
-// tests will fail even though client successfully connects. Need to identify when server is
-// actually ready
+/// Connect a client to 127.0.0.1. Call `wait_for_leader` on the node first
+/// to guarantee the server is up and a leader exists before connecting.
 async fn get_client() -> Result<Client, Box<dyn std::error::Error>> {
     let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
-    for _ in 0..5 {
-        if let Ok(_) = client.connect().await {
-            break;
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-    }
-
+    client.connect().await?;
     Ok(client)
 }
 
@@ -77,7 +69,7 @@ async fn get_client() -> Result<Client, Box<dyn std::error::Error>> {
 #[serial]
 async fn start_server() {
     let leader = get_leader().unwrap();
-    let handle = tokio::spawn(async move {
+    let _handle = tokio::spawn(async move {
         let _ = leader.start().await;
     });
 }
@@ -86,14 +78,16 @@ async fn start_server() {
 #[serial]
 async fn leader_election() {
     let leader = get_leader().unwrap();
-    let leader_clone = leader.clone();
-    let handle = tokio::spawn(async move {
-        let _ = leader_clone.start().await;
+    let leader_ref = leader.clone();
+    let _handle = tokio::spawn(async move {
+        let _ = leader_ref.start().await;
     });
 
     assert!(!(leader.is_leader_elected().await));
-    // Give leader time to elect itself
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     assert!(leader.is_leader_elected().await);
 }
 
@@ -101,10 +95,15 @@ async fn leader_election() {
 #[serial]
 async fn client_get() {
     let leader = get_leader().unwrap();
-    let handle = tokio::spawn(async move {
-        let _ = leader.start().await;
+    let leader_ref = leader.clone();
+    let _handle = tokio::spawn(async move {
+        let _ = leader_ref.start().await;
     });
 
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     let mut client = get_client().await.unwrap();
     assert_eq!(None, client.get::<String>("nil").await.unwrap());
 }
@@ -113,12 +112,17 @@ async fn client_get() {
 #[serial]
 async fn client_insert() {
     let leader = get_leader().unwrap();
-    let handle = tokio::spawn(async move {
-        let _ = leader.start().await;
+    let leader_ref = leader.clone();
+    let _handle = tokio::spawn(async move {
+        let _ = leader_ref.start().await;
     });
 
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     let mut client = get_client().await.unwrap();
-    client.insert::<String>("foo", "bar".into()).await;
+    client.insert::<String>("foo", "bar".into()).await.unwrap();
     assert_eq!(
         Some(String::from("bar")),
         client.get::<String>("foo").await.unwrap()
@@ -129,10 +133,15 @@ async fn client_insert() {
 #[serial]
 async fn client_remove() {
     let leader = get_leader().unwrap();
-    let handle = tokio::spawn(async move {
-        let _ = leader.start().await;
+    let leader_ref = leader.clone();
+    let _handle = tokio::spawn(async move {
+        let _ = leader_ref.start().await;
     });
 
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     let mut client = get_client().await.unwrap();
     client
         .insert::<String>("foo2", "bar2".into())
@@ -150,10 +159,15 @@ async fn client_remove() {
 #[serial]
 async fn drop_tree() {
     let leader = get_leader().unwrap();
-    let handle = tokio::spawn(async move {
-        let _ = leader.start().await;
+    let leader_ref = leader.clone();
+    let _handle = tokio::spawn(async move {
+        let _ = leader_ref.start().await;
     });
 
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     let mut client = get_client().await.unwrap();
     client
         .insert::<String>("parent/foo", "bar".into())
@@ -168,14 +182,15 @@ async fn drop_tree() {
 #[serial]
 async fn two_node_cluster() {
     let leader = get_leader().unwrap();
-    let leader_clone = leader.clone();
-    let handle = tokio::spawn(async move {
-        let _ = leader_clone.start().await;
+    let leader_ref = leader.clone();
+    let _handle = tokio::spawn(async move {
+        let _ = leader_ref.start().await;
     });
 
-    // Give leader time to elect itself
-    // Todo: again, need more reliable method for determining when servers are ready
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
 
     let follower = get_follower("127.0.0.2").unwrap();
     let follower_clone = follower.clone();
@@ -183,7 +198,8 @@ async fn two_node_cluster() {
         let _ = follower_clone.start().await;
     });
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    // Wait for the follower to join and the cluster config to replicate.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let leader_cluster = leader.get_cluster().await.unwrap();
     let follower_cluster = follower.get_cluster().await.unwrap();
@@ -205,9 +221,14 @@ struct MyStruct {
 async fn custom_struct() {
     let leader = get_leader().unwrap();
     let leader_clone = leader.clone();
-    let handle = tokio::spawn(async move {
+    let _handle = tokio::spawn(async move {
         let _ = leader_clone.start().await;
     });
+
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
 
     let my_struct = MyStruct {
         enabled: true,
@@ -239,10 +260,14 @@ async fn custom_struct() {
 async fn get_prefixes() {
     let leader = get_leader().unwrap();
     let leader_clone = leader.clone();
-    let handle = tokio::spawn(async move {
+    let _handle = tokio::spawn(async move {
         let _ = leader_clone.start().await;
     });
 
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     let mut client = get_client().await.unwrap();
     assert_eq!(Vec::<String>::new(), client.get_prefixes().await.unwrap());
     client.insert::<String>("parent/foo", "bar".into()).await;
@@ -261,10 +286,14 @@ async fn get_prefixes() {
 async fn list_prefixes() {
     let leader = get_leader().unwrap();
     let leader_clone = leader.clone();
-    let handle = tokio::spawn(async move {
+    let _handle = tokio::spawn(async move {
         let _ = leader_clone.start().await;
     });
 
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     let mut client = get_client().await.unwrap();
     assert_eq!(Vec::<String>::new(), client.list_keys("").await.unwrap());
 
@@ -296,10 +325,14 @@ async fn list_prefixes() {
 async fn watch_prefix() {
     let leader = get_leader().unwrap();
     let leader_clone = leader.clone();
-    let handle = tokio::spawn(async move {
+    let _handle = tokio::spawn(async move {
         let _ = leader_clone.start().await;
     });
 
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     let mut client1 = get_client().await.unwrap();
     let mut client2: Client = get_client().await.unwrap();
 
@@ -343,13 +376,17 @@ async fn three_node_cluster() {
     tokio::spawn(async move {
         let _ = leader_ref.start().await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = follower1_ref.start().await;
     });
     tokio::spawn(async move {
         let _ = follower2_ref.start().await;
     });
+    // Wait for both followers to join and the cluster config to replicate.
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     assert_eq!(3, leader.get_cluster().await.unwrap().len());
@@ -390,24 +427,29 @@ async fn leader_failure_reelection() {
     let leader_handle = tokio::spawn(async move {
         let _ = leader.start().await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    leader_ref
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = follower1_ref.start().await;
     });
     tokio::spawn(async move {
         let _ = follower2_ref.start().await;
     });
+    // Wait for both followers to join.
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     assert_eq!(3, follower1.get_cluster().await.unwrap().len());
 
-    // Shut down the leader: stop its election_manager first so it stops sending heartbeats,
-    // then kill the gRPC server. Followers will time out and re-elect.
+    // Shut down the leader: stop its election_manager first so it stops
+    // sending heartbeats, then kill the gRPC server. Followers will time
+    // out and re-elect.
     leader_ref.shutdown();
-    tokio::time::sleep(Duration::from_millis(100)).await; // let election_manager exit
+    tokio::time::sleep(Duration::from_millis(100)).await;
     leader_handle.abort();
 
-    // Poll until one of the remaining nodes wins an election (up to 2s)
+    // Poll until one of the remaining nodes wins an election (up to 2s).
     let mut new_leader_elected = false;
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -423,7 +465,7 @@ async fn leader_failure_reelection() {
         "no new leader elected after old leader died"
     );
 
-    // New cluster of 2 can still commit (2 > 3/2 = 1)
+    // New cluster of 2 can still commit (2 > 3/2 = 1).
     let mut client = skiff_rs::Client::new(vec![
         "127.0.0.2".parse().unwrap(),
         "127.0.0.3".parse().unwrap(),
@@ -452,7 +494,10 @@ async fn follower_crash_and_rejoin() {
     tokio::spawn(async move {
         let _ = leader_ref.start().await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = follower1_ref.start().await;
     });
@@ -462,9 +507,10 @@ async fn follower_crash_and_rejoin() {
             let _ = f.start().await;
         })
     };
+    // Wait for both followers to join.
     tokio::time::sleep(Duration::from_millis(600)).await;
 
-    // Insert before crash
+    // Insert before crash.
     let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     client.connect().await.unwrap();
     client
@@ -476,16 +522,16 @@ async fn follower_crash_and_rejoin() {
     let follower2_id = follower2.get_id();
     follower2.shutdown();
     follower2_handle.abort();
-    drop(follower2); // release Arc so sled lock is freed once the orphaned task exits
+    drop(follower2);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Insert while follower2 is down (leader + follower1 = majority)
+    // Insert while follower2 is down (leader + follower1 = majority).
     client
         .insert::<String>("during_crash", "yes".into())
         .await
         .unwrap();
 
-    // Restart follower2 from its existing data directory
+    // Restart follower2 from its existing data directory.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let follower2_restart = build_node_persist("127.0.0.3", vec!["127.0.0.1"]);
     let f2_id = follower2_restart.get_id();
@@ -499,16 +545,13 @@ async fn follower_crash_and_rejoin() {
         let _ = f2_ref.start().await;
     });
 
-    // Poll until follower2 is back in a known-cluster state
-    for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if follower2_restart.is_leader_elected().await {
-            break;
-        }
-    }
-    assert!(follower2_restart.is_leader_elected().await);
+    // Wait until follower2 is back in a known-cluster state.
+    follower2_restart
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
 
-    // Both keys are readable (forwarded to leader)
+    // Both keys are readable (forwarded to leader).
     let mut c = skiff_rs::Client::new(vec!["127.0.0.3".parse().unwrap()]);
     c.connect().await.unwrap();
     assert_eq!(
@@ -529,7 +572,10 @@ async fn concurrent_inserts() {
     let _handle = tokio::spawn(async move {
         let _ = leader_clone.start().await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
 
     let mut tasks = vec![];
     for i in 0u32..10 {
@@ -567,10 +613,14 @@ async fn remove_server_from_cluster() {
     let _lh = tokio::spawn(async move {
         let _ = leader_clone.start().await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     let _fh = tokio::spawn(async move {
         let _ = follower_clone.start().await;
     });
+    // Wait for the follower to join.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     assert_eq!(2, leader.get_cluster().await.unwrap().len());
@@ -585,7 +635,7 @@ async fn remove_server_from_cluster() {
         .await
         .unwrap();
 
-    // Allow the Configure entry to commit and apply
+    // Allow the Configure entry to commit and apply.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(1, leader.get_cluster().await.unwrap().len());
@@ -599,7 +649,7 @@ async fn restart_persistence() {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    // First run: insert data
+    // First run: insert data.
     let node = skiff_rs::Builder::new()
         .set_dir(dir)
         .bind("127.0.0.1".parse().unwrap())
@@ -610,7 +660,7 @@ async fn restart_persistence() {
     let handle = tokio::spawn(async move {
         let _ = node_clone.start().await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    node.wait_for_leader(Duration::from_secs(2)).await.unwrap();
 
     let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     client.connect().await.unwrap();
@@ -623,10 +673,10 @@ async fn restart_persistence() {
     // Simulate crash: stop background tasks, kill gRPC server, release sled lock.
     node.shutdown();
     handle.abort();
-    drop(node); // release Arc so sled is freed once the orphaned task exits
+    drop(node);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Second run: restart from same directory
+    // Second run: restart from same directory.
     let node2 = skiff_rs::Builder::new()
         .set_dir(dir)
         .bind("127.0.0.1".parse().unwrap())
@@ -635,10 +685,11 @@ async fn restart_persistence() {
 
     assert_eq!(id_before, node2.get_id(), "node id must survive restart");
 
+    let node2_ref = node2.clone();
     tokio::spawn(async move {
-        let _ = node2.start().await;
+        let _ = node2_ref.start().await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    node2.wait_for_leader(Duration::from_secs(2)).await.unwrap();
 
     let mut client2 = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     client2.connect().await.unwrap();
@@ -662,21 +713,25 @@ async fn subscriber_replication() {
     tokio::spawn(async move {
         let _ = l.start().await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = f1.start().await;
     });
     tokio::spawn(async move {
         let _ = f2.start().await;
     });
+    // Wait for both followers to join.
     tokio::time::sleep(Duration::from_millis(600)).await;
 
-    // Subscribe from follower2
+    // Subscribe from follower2.
     let mut sub_client = skiff_rs::Client::new(vec!["127.0.0.3".parse().unwrap()]);
     sub_client.connect().await.unwrap();
     let mut sub = sub_client.watch("repl/").await.unwrap();
 
-    // Insert from leader
+    // Insert from leader.
     let mut write_client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     write_client.connect().await.unwrap();
     write_client
@@ -707,10 +762,14 @@ async fn insert_timeout_leader_loss() {
     let _lh = tokio::spawn(async move {
         let _ = leader_clone.start().await;
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    leader
+        .wait_for_leader(Duration::from_secs(2))
+        .await
+        .unwrap();
     let follower_handle = tokio::spawn(async move {
         let _ = follower_clone.start().await;
     });
+    // Wait for the follower to join.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     assert_eq!(2, leader.get_cluster().await.unwrap().len());

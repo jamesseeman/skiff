@@ -43,10 +43,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind("127.0.0.1".parse()?)
         .build()?;
 
-    tokio::spawn(async move { node.start().await });
+    let node_ref = node.clone();
+    tokio::spawn(async move { node_ref.start().await });
 
-    // Wait for a leader to be elected.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Block until a leader is elected before connecting a client.
+    node.wait_for_leader(std::time::Duration::from_secs(2)).await?;
 
     // Connect a client and perform some operations.
     let mut client = Client::new(vec!["127.0.0.1".parse()?]);
@@ -66,6 +67,7 @@ Pass existing node addresses to `join_cluster` when constructing additional node
 
 ```rust
 use skiff_rs::Builder;
+use std::time::Duration;
 
 // Node 1 — bootstraps a new single-node cluster.
 let node1 = Builder::new()
@@ -80,7 +82,12 @@ let node2 = Builder::new()
     .join_cluster(vec!["127.0.0.1".parse()?])
     .build()?;
 
-tokio::spawn(async move { node1.start().await });
+let node1_ref = node1.clone();
+tokio::spawn(async move { node1_ref.start().await });
+
+// Wait for node1 to elect itself leader before node2 tries to join.
+node1.wait_for_leader(Duration::from_secs(2)).await?;
+
 tokio::spawn(async move { node2.start().await });
 ```
 
