@@ -1,4 +1,4 @@
-pub mod skiff_proto {
+pub(crate) mod skiff_proto {
     tonic::include_proto!("skiff");
 }
 
@@ -26,6 +26,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tonic::{transport::Channel, Request, Response, Status};
+use tracing::{debug, info, trace};
 use uuid::Uuid;
 
 const RAFT_META_TREE: &str = "__raft_meta";
@@ -144,10 +145,15 @@ struct Log {
     committed: Arc<(Mutex<bool>, Notify)>,
 }
 
+/// The current role of a node in the Raft protocol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ElectionState {
+    /// The node is campaigning for leadership.
     Candidate,
+    /// The node is the current cluster leader and accepts writes.
     Leader,
+    /// The node is a follower of the leader identified by the inner [`Uuid`].
+    /// A `Uuid::nil()` means no leader has been elected yet.
     Follower(Uuid),
 }
 
@@ -168,6 +174,12 @@ struct State {
     conn: sled::Db,
 }
 
+/// A single node in a skiff cluster.
+///
+/// Construct one with [`Builder`](crate::Builder) and call [`start`](Skiff::start)
+/// to begin serving requests.  The node spawns background tasks for leader
+/// election and heartbeat management; call [`shutdown`](Skiff::shutdown) before
+/// dropping to allow those tasks and the sled database to close cleanly.
 #[derive(Debug, Clone)]
 pub struct Skiff {
     id: Uuid,
@@ -240,23 +252,35 @@ impl Skiff {
 
     // todo: initializing a new cluster with a known config without needing to send add_server rpc
 
+    /// Return the stable, persistent UUID that identifies this node.
+    ///
+    /// The ID is generated on first startup and stored in sled so it survives
+    /// restarts.
     pub fn get_id(&self) -> Uuid {
         self.id
     }
 
-    /// Signal the node to stop its background tasks (election manager).
-    /// Call this before dropping the node to ensure sled is cleanly released.
+    /// Signal the node to stop its background tasks and close the gRPC server.
+    ///
+    /// This must be called before dropping the node in tests or applications
+    /// that restart nodes, because sled holds a file lock that is only released
+    /// once every `Arc` clone of the database handle has been dropped.
+    /// `shutdown` triggers a clean teardown so those clones are released
+    /// promptly.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
     }
 
+    /// Return the IPv4 address this node is bound to.
     pub fn get_address(&self) -> Ipv4Addr {
         self.address
     }
 
-    // This was named is_ready, but is_leader_elected is more accurate
-    // Consider renaming to is_ready as that's what we're trying to evaluate.
-    //  should consider logic further
+    /// Return `true` if the cluster has an active leader.
+    ///
+    /// This is `true` when this node is the leader, or when it is a follower
+    /// that has acknowledged a specific leader.  It is `false` during initial
+    /// startup or while an election is in progress.
     pub async fn is_leader_elected(&self) -> bool {
         let election_state = self.get_election_state().await;
         match election_state {
@@ -272,8 +296,15 @@ impl Skiff {
         }
     }
 
-    // Todo: consider if this should return result, although there should always be a cluster_config log
-    // handle missing cluster configuration? sole node in cluster?
+    /// Return the current cluster membership as a map of node ID → address.
+    ///
+    /// The membership is derived from the most recent `Configure` entry in the
+    /// Raft log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MissingClusterConfig`] if no configuration entry is
+    /// found (this should not happen under normal operation).
     pub async fn get_cluster(&self) -> Result<HashMap<Uuid, Ipv4Addr>, Error> {
         let config = match self
             .state
@@ -343,7 +374,7 @@ impl Skiff {
         let _ = lock.peer_clients.remove(id);
     }
 
-    // todo: consider making these macros
+    /// Return the node's current [`ElectionState`].
     pub async fn get_election_state(&self) -> ElectionState {
         self.state.lock().await.election_state.clone()
     }
@@ -515,7 +546,7 @@ impl Skiff {
             return Ok(());
         }
 
-        println!("Committing");
+        trace!("committing log entries");
         let new_logs: Vec<(usize, Action)> = self
             .state
             .lock()
@@ -610,7 +641,7 @@ impl Skiff {
                                     let mut updated_tree_vec =
                                         bincode::deserialize::<Vec<String>>(tree_vec).unwrap();
 
-                                    println!("{:?}, {}", updated_tree_vec, tree_name);
+                                    trace!(trees = ?updated_tree_vec, name = %tree_name, "dropping tree");
                                     if let Some(index) =
                                         updated_tree_vec.iter().position(|name| name == &prefix)
                                     {
@@ -654,17 +685,17 @@ impl Skiff {
 
     fn initialize_service(&self) -> SkiffServer<Skiff> {
         let skiff = self.clone();
-        let _: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        let _: tokio::task::JoinHandle<Result<(), Error>> = tokio::spawn(async move {
             // Todo: when we're restoring a cluster from previous operation (ex. after outage / migration)
             // the cluster len for all nodes will be > 1, but no leader exists yet, so add_server rpc fails.
             // Might be ok if leader election happens subsequently, but this should a) be verified
             // and b) logic for this scenario should be made obvious
             if skiff.get_cluster().await.unwrap().len() > 1 {
-                println!("Joining cluster");
+                debug!("joining cluster");
 
                 let mut joined_cluster = false;
                 for id in skiff.get_peers().await.keys() {
-                    println!("Asking {:?} to join cluster", id);
+                    debug!(?id, "asking peer to add us to cluster");
 
                     let mut request = Request::new(ServerRequest {
                         id: skiff.id.to_string(),
@@ -699,17 +730,16 @@ impl Skiff {
                 }
 
                 if !joined_cluster {
-                    return Err(Error::ClusterJoinFailed.into());
+                    return Err(Error::ClusterJoinFailed);
                 }
             }
             // Todo: if we are lone node in cluster we can skip election timeout and make ourselves leader
 
             let mut server1 = skiff.clone();
-            let _elections: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
-                tokio::spawn(async move {
-                    server1.election_manager().await?;
-                    Ok(())
-                });
+            let _elections: tokio::task::JoinHandle<Result<(), Error>> = tokio::spawn(async move {
+                server1.election_manager().await?;
+                Ok(())
+            });
 
             Ok(())
         });
@@ -717,9 +747,21 @@ impl Skiff {
         SkiffServer::new(self.clone())
     }
 
-    // Todo: Add token for authenticated joins
-    // Todo: snapshot / log compaction, resuming operation after restart
-    pub async fn start(self) -> Result<(), anyhow::Error> {
+    /// Start the node's gRPC server and block until [`shutdown`](Skiff::shutdown) is called.
+    ///
+    /// This method must be called (usually inside a `tokio::spawn`) for the
+    /// node to participate in the cluster.  It:
+    ///
+    /// 1. Spawns a background task that joins the cluster (if peers were
+    ///    provided) and then runs the election/heartbeat loop.
+    /// 2. Binds a tonic gRPC server on the configured address and port.
+    /// 3. Returns only after [`shutdown`](Skiff::shutdown) is called and all
+    ///    in-flight connections have been closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RPCBindFailed`] if the gRPC server cannot bind.
+    pub async fn start(self) -> Result<(), Error> {
         let service = self.initialize_service();
         let mut shutdown = self.shutdown_rx.clone();
 
@@ -735,11 +777,8 @@ impl Skiff {
         Ok(())
     }
 
-    async fn election_manager(&mut self) -> Result<(), anyhow::Error> {
-        let mut rng = {
-            let rng = rand::thread_rng();
-            StdRng::from_rng(rng)?
-        };
+    async fn election_manager(&mut self) -> Result<(), Error> {
+        let mut rng = StdRng::from_entropy();
 
         let mut rx_entries = self.rx_entries.lock().await;
         let mut shutdown = self.shutdown_rx.clone();
@@ -752,7 +791,6 @@ impl Skiff {
                 // todo: refactor this block:
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(75)) => {
-                        //println!("Sending heartbeat");
 
                         // todo: move peer connection + sending to separate thread so connection timeout
                         // doesn't result in election timeout
@@ -823,12 +861,11 @@ impl Skiff {
             } else {
                 tokio::select! {
                     Some(1) = rx_entries.recv() => {
-                        //println!("recv'd heartbeat");
                         continue;
                     }
 
                     _ = tokio::time::sleep(Duration::from_millis(rng.gen_range(150..300))) => {
-                        println!("Timeout: starting election");
+                        debug!("election timeout, starting election");
                         self.run_election().await?;
                     }
 
@@ -840,17 +877,18 @@ impl Skiff {
         Ok(())
     }
 
-    async fn run_election(&self) -> Result<(), anyhow::Error> {
+    async fn run_election(&self) -> Result<(), Error> {
         self.set_election_state(ElectionState::Candidate).await;
         self.increment_term().await;
         self.vote_for(Some(self.id)).await;
-        println!("Starting election, term: {}", self.get_current_term().await);
-        println!("{:?}", self.get_election_state().await);
+        let term = self.get_current_term().await;
+        let state = self.get_election_state().await;
+        debug!(?state, term, "starting election");
 
         let mut num_votes: u32 = 1; // including self
 
         for peer in self.get_peers().await.keys() {
-            println!("sending to client: {:?}", peer);
+            trace!(?peer, "requesting vote");
 
             let mut request = Request::new(VoteRequest {
                 term: self.get_current_term().await,
@@ -876,13 +914,13 @@ impl Skiff {
             };
 
             if response.vote_granted {
-                println!("Received vote from {:?}", &peer);
+                debug!(peer = ?&peer, "received vote");
                 num_votes += 1;
             }
         }
 
         if num_votes > self.get_cluster().await?.len() as u32 / 2 {
-            println!("Elected leader!");
+            info!("elected leader");
             self.set_election_state(ElectionState::Leader).await;
             self.vote_for(None).await;
 
@@ -943,7 +981,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         &self,
         request: Request<VoteRequest>,
     ) -> Result<Response<VoteReply>, Status> {
-        println!("received vote request");
+        trace!("received vote request");
 
         let current_term = self.get_current_term().await;
         let voted_for = self.get_voted_for().await;
@@ -967,7 +1005,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
             && vote_request.last_log_index >= last_log_index
             && vote_request.last_log_term >= last_log_term
         {
-            println!("Voting for {:?}", candidate_id);
+            debug!(?candidate_id, "granting vote");
 
             // Persist hard state before responding
             persist_hard_state(&conn, vote_request.term, Some(candidate_id))
@@ -1067,7 +1105,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
 
         for new_log in entry_request.entries {
             if new_log.index > last_log_index {
-                println!("Adding to log");
+                trace!("appending log entry");
                 let log_entry = Log {
                     index: new_log.index,
                     term: new_log.term,
@@ -1126,7 +1164,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
             return Err(Status::internal("failed to forward request to leader"));
         }
 
-        println!("Adding server to cluster");
+        debug!("adding server to cluster");
         let new_server = request.into_inner();
         let new_uuid = Uuid::from_str(&new_server.id).unwrap();
 

@@ -13,6 +13,27 @@ use crate::{
     Subscriber,
 };
 
+/// A client for interacting with a skiff cluster.
+///
+/// `Client` maintains a single gRPC connection to one cluster node.  All
+/// write requests are automatically forwarded to the current leader by the
+/// node, so the client does not need to track leadership itself.
+///
+/// # Example
+///
+/// ```no_run
+/// use skiff_rs::Client;
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut client = Client::new(vec!["127.0.0.1".parse()?]);
+/// client.connect().await?;
+///
+/// client.insert("key", "value").await?;
+/// let val: Option<String> = client.get("key").await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Client {
     conn: Option<SkiffClient<Channel>>,
@@ -20,6 +41,8 @@ pub struct Client {
     port: u16,
 }
 impl Client {
+    /// Create a new client that will try each address in `cluster` in order
+    /// when connecting.
     pub fn new(cluster: Vec<Ipv4Addr>) -> Self {
         Self {
             conn: None,
@@ -34,6 +57,15 @@ impl Client {
         self
     }
 
+    /// Establish a gRPC connection to the first reachable node in the cluster.
+    ///
+    /// This is called automatically by the other methods, but can be called
+    /// explicitly to verify connectivity before performing operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ClientConnectFailed`] if no node in the cluster list
+    /// can be reached.
     pub async fn connect(&mut self) -> Result<(), Error> {
         if self.conn.is_some() {
             return Ok(());
@@ -54,6 +86,14 @@ impl Client {
         Err(Error::ClientConnectFailed)
     }
 
+    /// Retrieve the value stored at `key`, deserializing it as `T`.
+    ///
+    /// Returns `Ok(None)` if the key does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC fails or the stored bytes cannot be
+    /// deserialized into `T`.
     pub async fn get<T: DeserializeOwned>(&mut self, key: &str) -> Result<Option<T>, Error> {
         self.connect().await?;
         let response = self
@@ -77,6 +117,15 @@ impl Client {
         }
     }
 
+    /// Insert or overwrite `key` with `value`.
+    ///
+    /// The call blocks until the entry has been committed to a majority of
+    /// cluster nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails, the RPC fails, or the cluster
+    /// does not commit the entry within the timeout.
     pub async fn insert<T: Serialize>(&mut self, key: &str, value: T) -> Result<(), Error> {
         self.connect().await?;
         let response = self
@@ -98,6 +147,15 @@ impl Client {
         }
     }
 
+    /// Remove `key` from the store.
+    ///
+    /// The call blocks until the deletion has been committed to a majority of
+    /// cluster nodes.  Returns `Ok(())` even if the key did not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC fails or the cluster does not commit the
+    /// deletion within the timeout.
     pub async fn remove(&mut self, key: &str) -> Result<(), Error> {
         self.connect().await?;
         let response = self
@@ -118,6 +176,15 @@ impl Client {
         }
     }
 
+    /// Return all key prefixes (namespace segments) currently in the store.
+    ///
+    /// Keys are organised hierarchically using `/` as a separator.  This
+    /// method returns the distinct prefix segments, e.g. `["users", "posts"]`
+    /// for a store containing `"users/alice"` and `"posts/hello"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC fails.
     pub async fn get_prefixes(&mut self) -> Result<Vec<String>, Error> {
         self.connect().await?;
         let response = self
@@ -133,6 +200,13 @@ impl Client {
         }
     }
 
+    /// Return all keys whose path starts with `prefix`.
+    ///
+    /// Pass an empty string or `"/"` to list all keys at the root level.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC fails.
     pub async fn list_keys(&mut self, prefix: &str) -> Result<Vec<String>, Error> {
         self.connect().await?;
         let response = self
@@ -150,6 +224,15 @@ impl Client {
         }
     }
 
+    /// Remove a node from the cluster configuration.
+    ///
+    /// `id` and `address` must match an existing member.  The removal is
+    /// propagated through the Raft log so all surviving nodes eventually drop
+    /// the node from their cluster view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC fails or the node is not found.
     pub async fn remove_node(&mut self, id: Uuid, address: Ipv4Addr) -> Result<(), Error> {
         self.connect().await?;
         let response = self
@@ -171,6 +254,15 @@ impl Client {
         }
     }
 
+    /// Subscribe to changes under `prefix`.
+    ///
+    /// Returns a [`Subscriber`] that yields a `(key, value)` pair each time
+    /// an entry whose path starts with `prefix` is inserted.  The stream
+    /// remains open until the connection is dropped or the server closes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC fails to establish the stream.
     pub async fn watch(&mut self, prefix: &str) -> Result<Subscriber, Error> {
         self.connect().await?;
         let response = self

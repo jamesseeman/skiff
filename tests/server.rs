@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serial_test::serial;
-use skiff::Client;
-use skiff::ElectionState;
-use skiff::Skiff;
-use skiff::Subscriber;
+use skiff_rs::Client;
+use skiff_rs::ElectionState;
+use skiff_rs::Skiff;
+use skiff_rs::Subscriber;
 
 /// Build a fresh node at `address`, optionally joining a cluster via `peers`.
 /// Always wipes the data directory first for a clean start.
@@ -23,7 +23,7 @@ fn build_node(address: &str, peers: Vec<&str>) -> Skiff {
 fn build_node_persist(address: &str, peers: Vec<&str>) -> Skiff {
     let dir = format!("target/tmp/test/{}", address);
     let peer_addrs: Vec<std::net::Ipv4Addr> = peers.iter().map(|p| p.parse().unwrap()).collect();
-    let mut builder = skiff::Builder::new()
+    let mut builder = skiff_rs::Builder::new()
         .set_dir(&dir)
         .bind(address.parse().unwrap());
     if !peer_addrs.is_empty() {
@@ -32,25 +32,25 @@ fn build_node_persist(address: &str, peers: Vec<&str>) -> Skiff {
     builder.build().unwrap()
 }
 
-fn get_leader() -> Result<Skiff, anyhow::Error> {
+fn get_leader() -> Result<Skiff, Box<dyn std::error::Error>> {
     let dir = String::from("target/tmp/test/127.0.0.1");
     if Path::exists(Path::new(&dir)) {
         fs::remove_dir_all(&dir)?;
     }
 
-    Ok(skiff::Builder::new()
+    Ok(skiff_rs::Builder::new()
         .set_dir(dir.as_str())
         .bind("127.0.0.1".parse()?)
         .build()?)
 }
 
-fn get_follower(address: &str) -> Result<Skiff, anyhow::Error> {
+fn get_follower(address: &str) -> Result<Skiff, Box<dyn std::error::Error>> {
     let dir = format!("target/tmp/test/{}", &address);
     if Path::exists(Path::new(&dir)) {
         fs::remove_dir_all(&dir)?;
     }
 
-    Ok(skiff::Builder::new()
+    Ok(skiff_rs::Builder::new()
         .set_dir(dir.as_str())
         .join_cluster(vec!["127.0.0.1".parse()?])
         .bind(address.parse()?)
@@ -60,8 +60,8 @@ fn get_follower(address: &str) -> Result<Skiff, anyhow::Error> {
 // Todo: there's still some race conditions here, for some reason if from_millis is too low
 // tests will fail even though client successfully connects. Need to identify when server is
 // actually ready
-async fn get_client() -> Result<Client, anyhow::Error> {
-    let mut client = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+async fn get_client() -> Result<Client, Box<dyn std::error::Error>> {
+    let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     for _ in 0..5 {
         if let Ok(_) = client.connect().await {
             break;
@@ -356,7 +356,7 @@ async fn three_node_cluster() {
     assert_eq!(3, follower1.get_cluster().await.unwrap().len());
     assert_eq!(3, follower2.get_cluster().await.unwrap().len());
 
-    let mut client = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+    let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     client.connect().await.unwrap();
     client
         .insert::<String>("replicated", "value".into())
@@ -367,7 +367,7 @@ async fn three_node_cluster() {
 
     // All three nodes carry the insert (reads are forwarded to leader)
     for addr in &["127.0.0.1", "127.0.0.2", "127.0.0.3"] {
-        let mut c = skiff::Client::new(vec![addr.parse().unwrap()]);
+        let mut c = skiff_rs::Client::new(vec![addr.parse().unwrap()]);
         c.connect().await.unwrap();
         assert_eq!(
             Some("value".to_string()),
@@ -424,7 +424,7 @@ async fn leader_failure_reelection() {
     );
 
     // New cluster of 2 can still commit (2 > 3/2 = 1)
-    let mut client = skiff::Client::new(vec![
+    let mut client = skiff_rs::Client::new(vec![
         "127.0.0.2".parse().unwrap(),
         "127.0.0.3".parse().unwrap(),
     ]);
@@ -465,7 +465,7 @@ async fn follower_crash_and_rejoin() {
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     // Insert before crash
-    let mut client = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+    let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     client.connect().await.unwrap();
     client
         .insert::<String>("before_crash", "yes".into())
@@ -509,7 +509,7 @@ async fn follower_crash_and_rejoin() {
     assert!(follower2_restart.is_leader_elected().await);
 
     // Both keys are readable (forwarded to leader)
-    let mut c = skiff::Client::new(vec!["127.0.0.3".parse().unwrap()]);
+    let mut c = skiff_rs::Client::new(vec!["127.0.0.3".parse().unwrap()]);
     c.connect().await.unwrap();
     assert_eq!(
         Some("yes".to_string()),
@@ -534,7 +534,7 @@ async fn concurrent_inserts() {
     let mut tasks = vec![];
     for i in 0u32..10 {
         tasks.push(tokio::spawn(async move {
-            let mut c = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+            let mut c = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
             c.insert::<u32>(&format!("concurrent_{}", i), i)
                 .await
                 .unwrap();
@@ -544,7 +544,7 @@ async fn concurrent_inserts() {
         t.await.unwrap();
     }
 
-    let mut client = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+    let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     for i in 0u32..10 {
         assert_eq!(
             Some(i),
@@ -578,7 +578,7 @@ async fn remove_server_from_cluster() {
     let follower_id = follower.get_id();
     let follower_addr = follower.get_address();
 
-    let mut client = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+    let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     client.connect().await.unwrap();
     client
         .remove_node(follower_id, follower_addr)
@@ -600,7 +600,7 @@ async fn restart_persistence() {
     }
 
     // First run: insert data
-    let node = skiff::Builder::new()
+    let node = skiff_rs::Builder::new()
         .set_dir(dir)
         .bind("127.0.0.1".parse().unwrap())
         .build()
@@ -612,7 +612,7 @@ async fn restart_persistence() {
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let mut client = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+    let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     client.connect().await.unwrap();
     client
         .insert::<String>("persistent_key", "persistent_value".into())
@@ -627,7 +627,7 @@ async fn restart_persistence() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Second run: restart from same directory
-    let node2 = skiff::Builder::new()
+    let node2 = skiff_rs::Builder::new()
         .set_dir(dir)
         .bind("127.0.0.1".parse().unwrap())
         .build()
@@ -640,7 +640,7 @@ async fn restart_persistence() {
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let mut client2 = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+    let mut client2 = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     client2.connect().await.unwrap();
     assert_eq!(
         Some("persistent_value".to_string()),
@@ -672,12 +672,12 @@ async fn subscriber_replication() {
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     // Subscribe from follower2
-    let mut sub_client = skiff::Client::new(vec!["127.0.0.3".parse().unwrap()]);
+    let mut sub_client = skiff_rs::Client::new(vec!["127.0.0.3".parse().unwrap()]);
     sub_client.connect().await.unwrap();
     let mut sub = sub_client.watch("repl/").await.unwrap();
 
     // Insert from leader
-    let mut write_client = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+    let mut write_client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     write_client.connect().await.unwrap();
     write_client
         .insert::<String>("repl/key1", "val1".into())
@@ -721,7 +721,7 @@ async fn insert_timeout_leader_loss() {
     follower_handle.abort();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut client = skiff::Client::new(vec!["127.0.0.1".parse().unwrap()]);
+    let mut client = skiff_rs::Client::new(vec!["127.0.0.1".parse().unwrap()]);
     client.connect().await.unwrap();
     let result = client.insert::<String>("no_quorum", "x".into()).await;
     assert!(result.is_err(), "insert should fail when quorum is lost");
