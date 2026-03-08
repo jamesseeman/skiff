@@ -28,6 +28,95 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tonic::{transport::Channel, Request, Response, Status};
 use uuid::Uuid;
 
+const RAFT_META_TREE: &str = "__raft_meta";
+const RAFT_LOG_TREE: &str = "__raft_log";
+const KEY_CURRENT_TERM: &[u8] = b"current_term";
+const KEY_VOTED_FOR: &[u8] = b"voted_for";
+const KEY_LAST_APPLIED: &[u8] = b"last_applied";
+
+#[derive(Serialize, Deserialize)]
+struct PersistedLog {
+    index: u32,
+    term: u32,
+    action: Action,
+}
+
+fn persist_hard_state(conn: &sled::Db, term: u32, voted_for: Option<Uuid>) -> Result<(), Error> {
+    let meta = conn.open_tree(RAFT_META_TREE)?;
+    meta.insert(KEY_CURRENT_TERM, &term.to_be_bytes())?;
+    match voted_for {
+        Some(id) => {
+            meta.insert(KEY_VOTED_FOR, id.as_bytes().as_slice())?;
+        }
+        None => {
+            meta.remove(KEY_VOTED_FOR)?;
+        }
+    };
+    Ok(())
+}
+
+fn persist_log_entry(conn: &sled::Db, log: &Log) -> Result<(), Error> {
+    let tree = conn.open_tree(RAFT_LOG_TREE)?;
+    let persisted = PersistedLog {
+        index: log.index,
+        term: log.term,
+        action: log.action.clone(),
+    };
+    tree.insert(log.index.to_be_bytes(), bincode::serialize(&persisted)?)?;
+    Ok(())
+}
+
+fn truncate_log_from(conn: &sled::Db, from_index: u32) -> Result<(), Error> {
+    let tree = conn.open_tree(RAFT_LOG_TREE)?;
+    let keys: Vec<_> = tree
+        .range(from_index.to_be_bytes()..)
+        .keys()
+        .collect::<Result<Vec<_>, _>>()?;
+    for key in keys {
+        tree.remove(key)?;
+    }
+    Ok(())
+}
+
+fn persist_last_applied(conn: &sled::Db, last_applied: u32) -> Result<(), Error> {
+    let meta = conn.open_tree(RAFT_META_TREE)?;
+    meta.insert(KEY_LAST_APPLIED, &last_applied.to_be_bytes())?;
+    Ok(())
+}
+
+fn load_raft_state(conn: &sled::Db) -> Result<(u32, Option<Uuid>, Vec<Log>, u32), Error> {
+    let meta = conn.open_tree(RAFT_META_TREE)?;
+
+    let current_term = meta
+        .get(KEY_CURRENT_TERM)?
+        .map(|b| u32::from_be_bytes(b.as_ref().try_into().unwrap_or([0; 4])))
+        .unwrap_or(0);
+
+    let voted_for = meta
+        .get(KEY_VOTED_FOR)?
+        .and_then(|b| Uuid::from_slice(b.as_ref()).ok());
+
+    let last_applied = meta
+        .get(KEY_LAST_APPLIED)?
+        .map(|b| u32::from_be_bytes(b.as_ref().try_into().unwrap_or([0; 4])))
+        .unwrap_or(0);
+
+    let log_tree = conn.open_tree(RAFT_LOG_TREE)?;
+    let mut log = Vec::new();
+    for result in log_tree.iter() {
+        let (_, value) = result?;
+        let persisted: PersistedLog = bincode::deserialize(&value)?;
+        log.push(Log {
+            index: persisted.index,
+            term: persisted.term,
+            action: persisted.action,
+            committed: Arc::new((Mutex::new(true), Notify::new())),
+        });
+    }
+
+    Ok((current_term, voted_for, log, last_applied))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum Action {
     Insert(String, Vec<u8>),
@@ -97,10 +186,11 @@ impl Skiff {
         let conn = sled::open(data_dir)?;
         let (tx_entries, rx_entries) = mpsc::channel(32);
 
-        // First convert peers into a vector of tuples (Uuid, Ipv4Addr)
-        // We don't know the actual uuids, we will retrieve them once the server starts
-        // For now, intialize with nil Uuids
-        // Finally add this node to the cluster
+        let (current_term, voted_for, persisted_log, last_applied) = load_raft_state(&conn)?;
+
+        // The index-0 entry is an in-memory sentinel carrying the bootstrap cluster config derived
+        // from the peers argument. Persisted log entries (index >= 1) are appended on top and take
+        // precedence in get_cluster() via rev().find(), so the latest Configure entry always wins.
         let mut cluster: HashMap<Uuid, Ipv4Addr> = peers
             .into_iter()
             .map(|addr| (Uuid::new_v4(), addr))
@@ -108,30 +198,28 @@ impl Skiff {
 
         cluster.insert(id, address);
 
-        // Initialize the log with the cluster
-        // Todo: need to consider how this will work once snapshots are implemented, as we'll need
-        // to initialize log with old config
-        // Todo: at the moment, with committed == last_applied == 0, this first log won't
-        // ever get written to disk. Needs to be resolved. Could be fixed with something like
-        // last_applied = -1, would require changing last_applied to i64
+        let mut log = vec![Log {
+            term: 0,
+            index: 0,
+            action: Action::Configure(cluster),
+            committed: Arc::new((Mutex::new(true), Notify::new())),
+        }];
+        log.extend(persisted_log);
+
         Ok(Skiff {
             id,
             address,
             state: Arc::new(Mutex::new(State {
                 election_state: ElectionState::Follower(Uuid::nil()),
-                current_term: 0,
-                voted_for: None,
-                committed_index: 0,
-                last_applied: 0,
+                current_term,
+                voted_for,
+                // Start conservative: committed_index catches up via leader heartbeats
+                committed_index: last_applied,
+                last_applied,
                 peer_clients: HashMap::new(),
                 next_index: HashMap::new(),
                 match_index: HashMap::new(),
-                log: vec![Log {
-                    term: 0,
-                    index: 0,
-                    action: Action::Configure(cluster),
-                    committed: Arc::new((Mutex::new(true), Notify::new())),
-                }],
+                log,
                 conn,
             })),
             tx_entries: Arc::new(Mutex::new(tx_entries)),
@@ -404,7 +492,7 @@ impl Skiff {
         (prev_log_index, prev_log_term, new_logs)
     }
 
-    async fn commit_logs(&self) -> Result<(), sled::Error> {
+    async fn commit_logs(&self) -> Result<(), Error> {
         let committed_index = self.state.lock().await.committed_index;
         let last_applied = self.state.lock().await.last_applied;
         if committed_index <= last_applied {
@@ -542,6 +630,8 @@ impl Skiff {
             }
         }
 
+        let conn = self.state.lock().await.conn.clone();
+        persist_last_applied(&conn, committed_index)?;
         self.state.lock().await.last_applied = committed_index;
 
         Ok(())
@@ -827,25 +917,36 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         let voted_for = self.get_voted_for().await;
         let last_log_index = self.get_last_log_index().await;
         let last_log_term = self.get_last_log_term().await;
+        let conn = self.state.lock().await.conn.clone();
 
         let vote_request = request.into_inner();
 
-        let correct_term = (vote_request.term > current_term && voted_for == Some(self.id))
-            || (vote_request.term >= current_term
-                && (voted_for.is_none()
-                    || voted_for == Some(Uuid::from_str(&vote_request.candidate_id).unwrap())));
+        let candidate_id = Uuid::from_str(&vote_request.candidate_id)
+            .map_err(|_| Status::invalid_argument("invalid candidate id"))?;
 
-        if correct_term
+        // Grant vote if:
+        // - Candidate's term is higher (fresh term, voted_for resets), OR
+        // - Same term and we haven't voted yet or already voted for this candidate
+        let can_vote = vote_request.term > current_term
+            || (vote_request.term == current_term
+                && (voted_for.is_none() || voted_for == Some(candidate_id)));
+
+        if can_vote
             && vote_request.last_log_index >= last_log_index
             && vote_request.last_log_term >= last_log_term
         {
-            println!("Voting for {:?}", vote_request.candidate_id);
-            self.vote_for(Some(Uuid::from_str(&vote_request.candidate_id).unwrap()))
+            println!("Voting for {:?}", candidate_id);
+
+            // Persist hard state before responding
+            persist_hard_state(&conn, vote_request.term, Some(candidate_id))
+                .map_err(|_| Status::internal("failed to persist hard state"))?;
+            conn.flush_async()
+                .await
+                .map_err(|_| Status::internal("failed to flush"))?;
+
+            self.vote_for(Some(candidate_id)).await;
+            self.set_election_state(ElectionState::Follower(candidate_id))
                 .await;
-            self.set_election_state(ElectionState::Follower(
-                Uuid::from_str(&vote_request.candidate_id).unwrap(),
-            ))
-            .await;
             self.set_current_term(vote_request.term).await;
 
             return Ok(Response::new(VoteReply {
@@ -864,9 +965,10 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         &self,
         request: Request<EntryRequest>,
     ) -> Result<Response<EntryReply>, Status> {
-        //println!("recv'd append_entry");
         let entry_request = request.into_inner();
         let current_term = self.get_current_term().await;
+        let conn = self.state.lock().await.conn.clone();
+
         if entry_request.term < current_term {
             return Ok(Response::new(EntryReply {
                 term: current_term,
@@ -874,16 +976,21 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
             }));
         }
 
+        // Update term and clear voted_for if the leader has a newer term
+        let term_changed = entry_request.term > current_term;
+        if term_changed {
+            self.set_current_term(entry_request.term).await;
+            self.vote_for(None).await;
+        }
+
         // Confirmed that we're receiving requests from a verified leader
         self.set_election_state(ElectionState::Follower(
             Uuid::from_str(&entry_request.leader_id).unwrap(),
         ))
         .await;
-        self.vote_for(None).await;
         self.reset_heartbeat_timer().await;
 
         if entry_request.prev_log_index > 0 {
-            // Todo: Probably come up with a more efficient way to do this
             let mut found_matching_log = false;
             for log in &self.state.lock().await.log {
                 if log.index == entry_request.prev_log_index
@@ -896,43 +1003,40 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
 
             if !found_matching_log {
                 return Ok(Response::new(EntryReply {
-                    term: current_term,
+                    term: entry_request.term,
                     success: false,
                 }));
             }
         }
 
-        // Todo: Again, probably come up with a better way to do this
         for new_log in &entry_request.entries {
             let mut drop_index: Option<u32> = None;
             for current_log in &self.state.lock().await.log {
-                // Find any conflicting logs where the index matches but the term is different
-                if current_log.index == new_log.index && current_log.term != entry_request.term {
+                // Conflict: same index but different term — truncate from here
+                if current_log.index == new_log.index && current_log.term != new_log.term {
                     drop_index = Some(current_log.index);
                 }
             }
 
-            // Drop any logs with index >= drop_index
             if let Some(drop_index) = drop_index {
                 self.state
                     .lock()
                     .await
                     .log
                     .retain(|log| log.index < drop_index);
+                truncate_log_from(&conn, drop_index)
+                    .map_err(|_| Status::internal("failed to truncate log"))?;
             }
         }
 
-        // if entry_request.entries.len() > 0 {
-        //     println!("{:?}", entry_request.entries);
-        // }
-
         let last_log_index = self.get_last_log_index().await;
+        let new_term = entry_request.term;
+        let mut appended_entries = false;
 
-        // Append new entries to the log
         for new_log in entry_request.entries {
             if new_log.index > last_log_index {
                 println!("Adding to log");
-                self.state.lock().await.log.push(Log {
+                let log_entry = Log {
                     index: new_log.index,
                     term: new_log.term,
                     action: match skiff_proto::Action::try_from(new_log.action) {
@@ -946,8 +1050,23 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
                         Err(_) => return Err(Status::invalid_argument("Invalid action")),
                     },
                     committed: Arc::new((Mutex::new(false), Notify::new())),
-                });
+                };
+                persist_log_entry(&conn, &log_entry)
+                    .map_err(|_| Status::internal("failed to persist log entry"))?;
+                self.state.lock().await.log.push(log_entry);
+                appended_entries = true;
             }
+        }
+
+        // Flush to stable storage before responding — required by Raft safety
+        if term_changed || appended_entries {
+            if term_changed {
+                persist_hard_state(&conn, new_term, None)
+                    .map_err(|_| Status::internal("failed to persist hard state"))?;
+            }
+            conn.flush_async()
+                .await
+                .map_err(|_| Status::internal("failed to flush"))?;
         }
 
         if entry_request.leader_commit > self.get_commit_index().await {
@@ -956,7 +1075,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         }
 
         Ok(Response::new(EntryReply {
-            term: current_term,
+            term: new_term,
             success: true,
         }))
     }
@@ -1006,7 +1125,7 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
     // Todo: no part of the program calls this yet
     async fn remove_server(
         &self,
-        request: Request<ServerRequest>,
+        _request: Request<ServerRequest>,
     ) -> Result<Response<ServerReply>, Status> {
         todo!()
     }

@@ -3,7 +3,7 @@ name = "skiff"
 version = "0.1.0"
 edition = "2021"
 authors = ["James Seeman"]
-keyboards = ["raft", "sled"]
+keywords = ["raft", "sled"]
 
 
 [dependencies]
