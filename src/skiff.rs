@@ -33,6 +33,7 @@ const RAFT_LOG_TREE: &str = "__raft_log";
 const KEY_CURRENT_TERM: &[u8] = b"current_term";
 const KEY_VOTED_FOR: &[u8] = b"voted_for";
 const KEY_LAST_APPLIED: &[u8] = b"last_applied";
+const KEY_NODE_ID: &[u8] = b"node_id";
 
 #[derive(Serialize, Deserialize)]
 struct PersistedLog {
@@ -82,6 +83,17 @@ fn persist_last_applied(conn: &sled::Db, last_applied: u32) -> Result<(), Error>
     let meta = conn.open_tree(RAFT_META_TREE)?;
     meta.insert(KEY_LAST_APPLIED, &last_applied.to_be_bytes())?;
     Ok(())
+}
+
+fn load_or_create_id(conn: &sled::Db) -> Result<Uuid, Error> {
+    let meta = conn.open_tree(RAFT_META_TREE)?;
+    if let Some(bytes) = meta.get(KEY_NODE_ID)? {
+        return Uuid::from_slice(bytes.as_ref()).map_err(|_| Error::DeserializeFailed);
+    }
+    let id = Uuid::new_v4();
+    meta.insert(KEY_NODE_ID, id.as_bytes().as_slice())?;
+    conn.flush()?;
+    Ok(id)
 }
 
 fn load_raft_state(conn: &sled::Db) -> Result<(u32, Option<Uuid>, Vec<Log>, u32), Error> {
@@ -160,30 +172,22 @@ struct State {
 pub struct Skiff {
     id: Uuid,
     address: Ipv4Addr,
+    port: u16,
     state: Arc<Mutex<State>>,
     tx_entries: Arc<Mutex<mpsc::Sender<u8>>>,
     rx_entries: Arc<Mutex<mpsc::Receiver<u8>>>,
     subscribers: Arc<Mutex<HashMap<String, Vec<mpsc::Sender<SubscribeReply>>>>>,
 }
 
-// Todo: env logging
-// Todo: add clap, cli params
-// Todo: add configuration parameters for
-// - when to drop unresponsive peer
-// - threshold for automatically snapshotting
-// and add corresponding functionality
-// Todo: allow custom port, swap out Ipv4Addr w SocketAddr where appropriate
-// Todo: separate address into bind_addr and advertise_addr
-// Todo: docs
-// Todo: publish to crates.io
 impl Skiff {
-    pub fn new(
-        id: Uuid,
+    pub(crate) fn new(
         address: Ipv4Addr,
+        port: u16,
         data_dir: String,
         peers: Vec<Ipv4Addr>,
     ) -> Result<Self, Error> {
         let conn = sled::open(data_dir)?;
+        let id = load_or_create_id(&conn)?;
         let (tx_entries, rx_entries) = mpsc::channel(32);
 
         let (current_term, voted_for, persisted_log, last_applied) = load_raft_state(&conn)?;
@@ -209,6 +213,7 @@ impl Skiff {
         Ok(Skiff {
             id,
             address,
+            port,
             state: Arc::new(Mutex::new(State {
                 election_state: ElectionState::Follower(Uuid::nil()),
                 current_term,
@@ -305,7 +310,7 @@ impl Skiff {
 
         match SkiffClient::connect(format!(
             "http://{}",
-            SocketAddrV4::new(*peers.get(peer).unwrap(), 9400)
+            SocketAddrV4::new(*peers.get(peer).unwrap(), self.port)
         ))
         .await
         {
@@ -550,9 +555,8 @@ impl Skiff {
                     for (sub_prefix, senders) in subscribers.iter_mut() {
                         // Todo: this could cause issues when the provided prefix is parent/ and tree is ex. parents/ or parent1/, etc
                         if prefix.starts_with(sub_prefix.trim_end_matches("/")) {
-                            let mut drop_senders = Vec::new();
-                            for (i, sender) in senders.iter_mut().enumerate() {
-                                // Todo: delete the sender if this receives an error
+                            let mut live_senders = Vec::new();
+                            for sender in senders.drain(..) {
                                 match sender
                                     .send(SubscribeReply {
                                         key: full_key.clone(),
@@ -561,15 +565,11 @@ impl Skiff {
                                     })
                                     .await
                                 {
-                                    Ok(_) => continue,
-                                    Err(_) => {
-                                        drop_senders.push(i);
-                                    }
+                                    Ok(_) => live_senders.push(sender),
+                                    Err(_) => {} // receiver dropped, discard sender
                                 }
                             }
-                            for i in drop_senders {
-                                senders.remove(i);
-                            }
+                            *senders = live_senders;
                         }
                     }
 
@@ -641,8 +641,7 @@ impl Skiff {
         let _ = self.tx_entries.lock().await.send(1).await; // Can be anything
     }
 
-    // Todo: consider making this async, waiting for cluster join to finish
-    pub fn initialize_service(&self) -> SkiffServer<Skiff> {
+    fn initialize_service(&self) -> SkiffServer<Skiff> {
         let skiff = self.clone();
         let _: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
             // Todo: when we're restoring a cluster from previous operation (ex. after outage / migration)
@@ -712,7 +711,7 @@ impl Skiff {
     pub async fn start(self) -> Result<(), anyhow::Error> {
         let service = self.initialize_service();
 
-        let bind_address = SocketAddr::new(self.address.into(), 9400);
+        let bind_address = SocketAddr::new(self.address.into(), self.port);
         tonic::transport::Server::builder()
             .add_service(service)
             .serve(bind_address)
@@ -758,8 +757,10 @@ impl Skiff {
                             // Todo: see if there's a more idiomatic way to set timeout
                             request.set_timeout(Duration::from_millis(300));
 
-                            // todo: if response term > current_term, switch to follower, same for request_vote
-                            let client_arc = self.get_peer_client(peer).await.unwrap();
+                            let client_arc = match self.get_peer_client(peer).await {
+                                Ok(c) => c,
+                                Err(_) => { self.drop_peer_client(peer).await; continue; }
+                            };
                             let mut client = client_arc.lock().await;
                             match client.append_entry(request).await {
                                 Ok(response) => {
@@ -840,7 +841,13 @@ impl Skiff {
             });
             request.set_timeout(Duration::from_millis(300));
 
-            let client = self.get_peer_client(peer).await.unwrap();
+            let client = match self.get_peer_client(peer).await {
+                Ok(c) => c,
+                Err(_) => {
+                    self.drop_peer_client(peer).await;
+                    continue;
+                }
+            };
             let response = match client.lock().await.request_vote(request).await {
                 Ok(response) => response.into_inner(),
                 Err(_) => {
@@ -890,7 +897,13 @@ impl Skiff {
                 });
                 request.set_timeout(Duration::from_millis(300));
 
-                let client_arc = self.get_peer_client(id).await.unwrap();
+                let client_arc = match self.get_peer_client(id).await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        self.drop_peer_client(id).await;
+                        continue;
+                    }
+                };
                 let mut client = client_arc.lock().await;
                 if let Err(_) = client.append_entry(request).await {
                     self.drop_peer_client(id).await;
@@ -1122,12 +1135,13 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         }))
     }
 
-    // Todo: no part of the program calls this yet
     async fn remove_server(
         &self,
         _request: Request<ServerRequest>,
     ) -> Result<Response<ServerReply>, Status> {
-        todo!()
+        Err(Status::unimplemented(
+            "remove_server is not yet implemented",
+        ))
     }
 
     // Todo: maybe add watch_prefix function that communicates changes to clients
@@ -1198,10 +1212,10 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
             .log(Action::Insert(insert_request.key, insert_request.value))
             .await;
 
-        // Wait until the log is committed
-        // Todo: implement timeout
         let (_, notify) = &*commit_arc;
-        notify.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .map_err(|_| Status::deadline_exceeded("timed out waiting for commit"))?;
         Ok(Response::new(InsertReply { success: true }))
     }
 
@@ -1223,10 +1237,10 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         let delete_request = request.into_inner();
         let commit_arc = self.log(Action::Delete(delete_request.key)).await;
 
-        // Wait until the log is committed
-        // Todo: implement timeout
         let (_, notify) = &*commit_arc;
-        notify.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .map_err(|_| Status::deadline_exceeded("timed out waiting for commit"))?;
         Ok(Response::new(DeleteReply { success: true }))
     }
 

@@ -14,9 +14,13 @@ impl Subscriber {
     }
 
     pub async fn recv<T: DeserializeOwned>(&mut self) -> Result<(String, T), Error> {
-        // Todo: better error handling
-        let message = self.stream.next().await.unwrap().unwrap();
-        let value = message.value.unwrap();
+        let message = self
+            .stream
+            .next()
+            .await
+            .ok_or(Error::StreamClosed)?
+            .map_err(|_| Error::RPCCallFailed)?;
+        let value = message.value.ok_or(Error::DeserializeFailed)?;
         Ok((message.key, bincode::deserialize::<T>(value.as_slice())?))
     }
 }

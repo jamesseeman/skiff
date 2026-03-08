@@ -16,14 +16,21 @@ use crate::{
 pub struct Client {
     conn: Option<SkiffClient<Channel>>,
     cluster: Vec<Ipv4Addr>,
+    port: u16,
 }
 impl Client {
-    // todo: get cluster config from server
     pub fn new(cluster: Vec<Ipv4Addr>) -> Self {
         Self {
             conn: None,
             cluster,
+            port: 9400,
         }
+    }
+
+    /// Override the port used to connect to cluster nodes. Defaults to `9400`.
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
     }
 
     pub async fn connect(&mut self) -> Result<(), Error> {
@@ -32,7 +39,9 @@ impl Client {
         }
 
         for peer in self.cluster.iter() {
-            match SkiffClient::connect(format!("http://{}", SocketAddrV4::new(*peer, 9400))).await {
+            match SkiffClient::connect(format!("http://{}", SocketAddrV4::new(*peer, self.port)))
+                .await
+            {
                 Ok(conn) => {
                     self.conn = Some(conn);
                     return Ok(());

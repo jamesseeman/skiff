@@ -31,6 +31,8 @@ pub enum Error {
     PeerNotFound,
     #[error("Failed to connect to peer")]
     PeerConnectFailed,
+    #[error("Subscriber stream closed")]
+    StreamClosed,
 }
 
 impl From<tonic::transport::Error> for Error {

@@ -1,14 +1,14 @@
 use crate::{error::Error, Skiff};
 use std::net::Ipv4Addr;
-use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Builder {
     bind_address: Ipv4Addr,
+    port: u16,
     data_dir: String,
 
-    // If empty, we are the leader of a new cluster
-    // Otherwise, we are a follower in an existing cluster
+    // If empty, we are the sole node in a new cluster.
+    // Otherwise, we are joining an existing cluster.
     peers: Vec<Ipv4Addr>,
 }
 
@@ -22,6 +22,7 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             bind_address: Ipv4Addr::new(127, 0, 0, 1),
+            port: 9400,
             data_dir: "/tmp/skiff".to_string(),
             peers: vec![],
         }
@@ -37,13 +38,17 @@ impl Builder {
         self
     }
 
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
     pub fn join_cluster(mut self, peers: Vec<Ipv4Addr>) -> Self {
         self.peers = peers;
         self
     }
 
-    // todo: load id, snapshots, etc from data_dir if present
     pub fn build(self) -> Result<Skiff, Error> {
-        Skiff::new(Uuid::new_v4(), self.bind_address, self.data_dir, self.peers)
+        Skiff::new(self.bind_address, self.port, self.data_dir, self.peers)
     }
 }

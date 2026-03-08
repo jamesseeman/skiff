@@ -3,7 +3,11 @@ name = "skiff"
 version = "0.1.0"
 edition = "2021"
 authors = ["James Seeman"]
-keywords = ["raft", "sled"]
+description = "An embedded Raft consensus library backed by sled"
+license = "MIT"
+repository = "https://github.com/jseeman/skiff"
+keywords = ["raft", "consensus", "distributed", "sled", "kv"]
+categories = ["database-implementations", "network-programming"]
 
 
 [dependencies]
