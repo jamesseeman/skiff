@@ -1,4 +1,4 @@
-# skiff-rs
+# skiff
 
 [![Crates.io](https://img.shields.io/crates/v/skiff-rs.svg)](https://crates.io/crates/skiff-rs)
 [![docs.rs](https://docs.rs/skiff-rs/badge.svg)](https://docs.rs/skiff-rs)
