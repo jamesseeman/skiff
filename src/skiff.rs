@@ -567,30 +567,31 @@ impl Skiff {
                     let key = tree_parts.pop().unwrap();
 
                     let prefix = tree_parts.join("/");
-                    let tree_name = match prefix.len() {
-                        0 => "base".to_string(),
-                        _ => {
-                            self.state
-                                .lock()
-                                .await
-                                .conn
-                                .update_and_fetch("trees", |trees| match trees {
-                                    Some(tree_vec) => {
-                                        let mut updated_tree_vec =
-                                            bincode::deserialize::<Vec<String>>(tree_vec).unwrap();
+                    let tree_name =
+                        match prefix.len() {
+                            0 => "base".to_string(),
+                            _ => {
+                                let _ = self.state.lock().await.conn.update_and_fetch(
+                                    "trees",
+                                    |trees| match trees {
+                                        Some(tree_vec) => {
+                                            let mut updated_tree_vec =
+                                                bincode::deserialize::<Vec<String>>(tree_vec)
+                                                    .unwrap();
 
-                                        if !updated_tree_vec.contains(&prefix) {
-                                            updated_tree_vec.push(prefix.clone());
+                                            if !updated_tree_vec.contains(&prefix) {
+                                                updated_tree_vec.push(prefix.clone());
+                                            }
+
+                                            Some(bincode::serialize(&updated_tree_vec).unwrap())
                                         }
+                                        None => Some(bincode::serialize(&vec![&prefix]).unwrap()),
+                                    },
+                                );
 
-                                        Some(bincode::serialize(&updated_tree_vec).unwrap())
-                                    }
-                                    None => Some(bincode::serialize(&vec![&prefix]).unwrap()),
-                                });
-
-                            format!("base_{}", &prefix.replace("/", "_"))
-                        }
-                    };
+                                format!("base_{}", &prefix.replace("/", "_"))
+                            }
+                        };
 
                     // Todo: maybe alert subscribers on delete
                     let mut subscribers = self.subscribers.lock().await;
@@ -599,17 +600,17 @@ impl Skiff {
                         if prefix.starts_with(sub_prefix.trim_end_matches("/")) {
                             let mut live_senders = Vec::new();
                             for sender in senders.drain(..) {
-                                match sender
+                                if sender
                                     .send(SubscribeReply {
                                         key: full_key.clone(),
                                         action: skiff_proto::Action::Insert as i32,
                                         value: Some(value.clone()),
                                     })
                                     .await
+                                    .is_ok()
                                 {
-                                    Ok(_) => live_senders.push(sender),
-                                    Err(_) => {} // receiver dropped, discard sender
-                                }
+                                    live_senders.push(sender);
+                                } // else: receiver dropped, discard sender
                             }
                             *senders = live_senders;
                         }
@@ -636,7 +637,7 @@ impl Skiff {
 
                         if tree.is_empty() {
                             let _ = lock.conn.drop_tree(&tree_name);
-                            lock.conn.update_and_fetch("trees", |trees| match trees {
+                            let _ = lock.conn.update_and_fetch("trees", |trees| match trees {
                                 Some(tree_vec) => {
                                     let mut updated_tree_vec =
                                         bincode::deserialize::<Vec<String>>(tree_vec).unwrap();
@@ -685,7 +686,7 @@ impl Skiff {
 
     fn initialize_service(&self) -> SkiffServer<Skiff> {
         let skiff = self.clone();
-        let _: tokio::task::JoinHandle<Result<(), Error>> = tokio::spawn(async move {
+        drop(tokio::spawn(async move {
             // Todo: when we're restoring a cluster from previous operation (ex. after outage / migration)
             // the cluster len for all nodes will be > 1, but no leader exists yet, so add_server rpc fails.
             // Might be ok if leader election happens subsequently, but this should a) be verified
@@ -742,7 +743,7 @@ impl Skiff {
             });
 
             Ok(())
-        });
+        }));
 
         SkiffServer::new(self.clone())
     }
@@ -777,13 +778,13 @@ impl Skiff {
         Ok(())
     }
 
+    #[allow(unreachable_code)]
     async fn election_manager(&mut self) -> Result<(), Error> {
         let mut rng = StdRng::from_entropy();
 
         let mut rx_entries = self.rx_entries.lock().await;
         let mut shutdown = self.shutdown_rx.clone();
 
-        #[allow(unreachable_code)]
         loop {
             self.commit_logs().await?;
 
@@ -962,7 +963,7 @@ impl Skiff {
                     }
                 };
                 let mut client = client_arc.lock().await;
-                if let Err(_) = client.append_entry(request).await {
+                if client.append_entry(request).await.is_err() {
                     self.drop_peer_client(id).await;
                 }
             }
@@ -1173,8 +1174,8 @@ impl skiff_proto::skiff_server::Skiff for Skiff {
         let id = Uuid::from_str(&new_server.id).unwrap();
         let addr = Ipv4Addr::from_str(&new_server.address).unwrap();
 
-        if cluster_config.get(&id).is_none() {
-            cluster_config.insert(id, addr);
+        if let std::collections::hash_map::Entry::Vacant(e) = cluster_config.entry(id) {
+            e.insert(addr);
             self.log(Action::Configure(cluster_config.clone())).await;
         }
 
